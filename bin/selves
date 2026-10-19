@@ -1,0 +1,672 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# selves-lite — Manage your selves in Claude Code.
+# Folder-aware Claude Code profiles: the right account in every project,
+# side by side. Bash edition of `selves`; implements the [core] parts of SPEC.md.
+#
+# Linux and macOS. Requires bash >= 3.2 and coreutils; python3 is optional
+# (used to validate .claude.json).
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+VERSION="1.0.0"
+CLAUDE_HOME="$HOME/.claude"
+PREFIX="$HOME/.claude-"
+MARKER=".selves-profile"
+LEGACY_MARKER=".profile-name"
+BIND_FILE=".selves"
+LEGACY_BIND_FILE=".claude-profile"
+SHARED_ITEMS="${SELVES_SHARED:-CLAUDE.md skills rules agents commands}"
+RESERVED="base default create adopt list ls delete rm remove run launch auto bind unbind which relink unshare repair doctor init migrate status version help dotfiles"
+LEGACY_RC_BEGIN="# >>> claude-switch >>>"
+LEGACY_RC_END="# <<< claude-switch <<<"
+
+if [ -n "${SELVES_CONFIG_DIR:-}" ]; then
+    CONF_DIR="$SELVES_CONFIG_DIR"
+elif [ "$(uname -s)" = "Darwin" ] && [ -z "${XDG_CONFIG_HOME:-}" ]; then
+    CONF_DIR="$HOME/Library/Application Support/selves"
+else
+    CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/selves"
+fi
+DEFAULT_FILE="$CONF_DIR/default"
+LEGACY_DEFAULT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-switch/default"
+
+# ── Output ──────────────────────────────────────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[0;33m'; C=$'\033[0;36m'
+    B=$'\033[1m'; D=$'\033[2m'; X=$'\033[0m'
+else
+    R=""; G=""; Y=""; C=""; B=""; D=""; X=""
+fi
+ok()    { printf '  %s✔%s  %s\n' "$G" "$X" "$*"; }
+info()  { printf '  %s▶%s  %s\n' "$C" "$X" "$*"; }
+warn()  { printf '  %s!%s  %s\n' "$Y" "$X" "$*" >&2; }
+err()   { printf '  %s✘%s  %s\n' "$R" "$X" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+usage() { err "$*"; exit 2; }
+
+is_tty_in() { [ -t 0 ]; }
+
+confirm() {   # $1 = question; $2 = "yes" to skip
+    [ "${2:-}" = "yes" ] && return 0
+    is_tty_in || usage "Confirmation needed: re-run with --yes."
+    local a
+    read -r -p "  $1 [y/N] " a
+    case "$a" in y|Y|yes|YES|s|S|si|sí) return 0 ;; *) return 1 ;; esac
+}
+
+perms() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || echo "?"; }
+
+# shellcheck disable=SC2088  # literal "~" is intended (display only)
+tildify() { case "$1" in "$HOME") printf '~' ;; "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+
+realpath_of() {
+    realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null \
+      || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null \
+      || echo "$1"
+}
+
+SELF="$(realpath_of "${BASH_SOURCE[0]}")"
+
+# Atomic write: content from stdin → file (keeps mode; follows a symlinked rc file)
+atomic_write() {
+    local target="$1" mode tmp
+    [ -L "$target" ] && target="$(realpath_of "$target")"
+    if [ -e "$target" ]; then mode="$(perms "$target")"; else mode=644; fi
+    tmp="$(mktemp "$(dirname "$target")/.selves-tmp.XXXXXX")"
+    cat > "$tmp"
+    [ "$mode" != "?" ] && chmod "$mode" "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$target"
+}
+
+backup_once() {   # $1 = file, $2 = suffix
+    [ -e "$1" ] && [ ! -e "$1$2" ] && cp -p -- "$1" "$1$2"
+    return 0
+}
+
+# ── Profiles ────────────────────────────────────────────────────────────────
+valid_name_syntax() { [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_-]{0,31}$ ]]; }
+
+check_new_name() {
+    local n="$1" r p
+    valid_name_syntax "$n" || usage "Invalid name '$n': letters, digits, - and _; must start with a letter; max 32."
+    for r in $RESERVED; do [ "$n" = "$r" ] && usage "'$n' is a reserved name."; done
+    if [ "$(uname -s)" = "Darwin" ]; then
+        for p in $(list_profiles); do
+            if [ "$(printf %s "$p" | tr '[:upper:]' '[:lower:]')" = "$(printf %s "$n" | tr '[:upper:]' '[:lower:]')" ] && [ "$p" != "$n" ]; then
+                usage "'$n' collides with existing profile '$p' (case-insensitive filesystem)."
+            fi
+        done
+    fi
+    return 0
+}
+
+profile_dir() { if [ "$1" = "base" ]; then echo "$CLAUDE_HOME"; else echo "${PREFIX}$1"; fi; }
+
+marker_of() {   # prints marker path of a profile dir, or nothing
+    if [ -f "$1/$MARKER" ]; then echo "$1/$MARKER"
+    elif [ -f "$1/$LEGACY_MARKER" ]; then echo "$1/$LEGACY_MARKER"; fi
+}
+
+profile_exists() {
+    [ "$1" = "base" ] && return 0
+    valid_name_syntax "$1" || return 1
+    [ -n "$(marker_of "$(profile_dir "$1")")" ]
+}
+
+is_bare() {
+    local m; m="$(marker_of "$(profile_dir "$1")")"
+    [ -n "$m" ] && sed -n 2p "$m" | grep -qx bare
+}
+
+list_profiles() {
+    local d n
+    for d in "${PREFIX}"*/; do
+        [ -d "$d" ] || continue
+        [ -n "$(marker_of "${d%/}")" ] || continue
+        n="${d%/}"; n="${n##*/}"; echo "${n#.claude-}"
+    done
+}
+
+has_login() {
+    local dir="$1"
+    if [ -f "$dir/.credentials.json" ]; then echo yes
+    elif [ "$(uname -s)" = "Darwin" ]; then echo keychain
+    else echo no; fi
+}
+
+# ── Resolution (SPEC §4) ────────────────────────────────────────────────────
+read_binding_value() {   # first non-empty, non-comment line, trimmed
+    awk 'NF && $0 !~ /^[[:space:]]*#/ { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }' "$1"
+}
+
+# Prints "<file>" of the nearest binding (new format preferred per directory)
+find_binding_file() {
+    local dir="${PWD:-$(pwd)}"
+    while :; do
+        if [ -f "$dir/$BIND_FILE" ]; then echo "$dir/$BIND_FILE"; return 0; fi
+        if [ -f "$dir/$LEGACY_BIND_FILE" ]; then echo "$dir/$LEGACY_BIND_FILE"; return 0; fi
+        [ "$dir" = "/" ] && return 1
+        dir="$(dirname "$dir")"
+    done
+}
+
+get_default() {
+    local n="" f=""
+    if [ -f "$DEFAULT_FILE" ]; then f="$DEFAULT_FILE"
+    elif [ -f "$LEGACY_DEFAULT_FILE" ]; then f="$LEGACY_DEFAULT_FILE"; fi
+    [ -n "$f" ] && n="$(read_binding_value "$f" || true)"
+    if [ -n "$n" ] && profile_exists "$n"; then echo "$n"; else echo "base"; fi
+}
+
+# Sets RESOLVED and RESOLVED_HOW; exits on invalid bindings
+resolve_profile() {
+    local f n
+    if f="$(find_binding_file)"; then
+        n="$(read_binding_value "$f" || true)"
+        if [ "$n" != "base" ] && ! valid_name_syntax "$n"; then
+            die "Invalid profile name '${n}' in $f"
+        fi
+        profile_exists "$n" || die "Profile '$n' (from $f) does not exist. Create it with: selves create $n"
+        RESOLVED="$n"; RESOLVED_HOW="binding $f"
+        return 0
+    fi
+    RESOLVED="$(get_default)"
+    if [ "$RESOLVED" = "base" ] && [ ! -f "$DEFAULT_FILE" ] && [ ! -f "$LEGACY_DEFAULT_FILE" ]; then
+        RESOLVED_HOW="fallback (no binding, no default)"
+    else
+        RESOLVED_HOW="default profile"
+    fi
+}
+
+# ── .claude.json repair (SPEC §7) ───────────────────────────────────────────
+json_ok() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$1" 2>/dev/null
+}
+
+repair_json() {
+    local dir="$1" f="$1/.claude.json" ts b
+    [ -f "$f" ] || return 0
+    json_ok "$f" && return 0
+    ts="$(date +%Y%m%d-%H%M%S)"
+    warn "$f is corrupt; kept as .claude.json.corrupt-$ts"
+    mv -- "$f" "$f.corrupt-$ts"
+    # Newest valid backup whose name contains "claude.json" (dotfiles included)
+    local best=""
+    for b in "$dir"/backups/*claude.json* "$dir"/backups/.*claude.json*; do
+        [ -f "$b" ] || continue
+        json_ok "$b" || continue
+        if [ -z "$best" ] || [ "$b" -nt "$best" ]; then best="$b"; fi
+    done
+    if [ -n "$best" ]; then
+        cp -p -- "$best" "$f"; chmod 600 "$f"
+        ok "Restored from backups/${best##*/}"
+        return 0
+    fi
+    warn "No valid backup in $dir/backups; Claude Code will start with a fresh config."
+}
+
+# ── Sessions (SPEC §9, Linux) ───────────────────────────────────────────────
+sessions_running() {
+    local dir="${1%/}" n=0 p exe cfg
+    [ -d /proc ] || { echo 0; return; }
+    for p in /proc/[0-9]*; do
+        [ "${p#/proc/}" = "$$" ] && continue
+        [ -O "$p" ] || continue
+        [ -r "$p/environ" ] || continue
+        exe="$(readlink "$p/exe" 2>/dev/null || true)"
+        [ "${exe##*/}" = "claude" ] || continue
+        cfg="$(tr '\0' '\n' < "$p/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -n1)"
+        [ -z "$cfg" ] && cfg="$CLAUDE_HOME"
+        [ "${cfg%/}" = "$dir" ] && n=$((n+1))
+    done
+    echo "$n"
+}
+
+# ── Shared layer (SPEC §6) ──────────────────────────────────────────────────
+link_shared() {
+    local dir="$1" item src dst
+    for item in $SHARED_ITEMS; do
+        src="$CLAUDE_HOME/$item"; dst="$dir/$item"
+        if [ -L "$dst" ]; then
+            if [ -e "$src" ]; then
+                rm -f -- "$dst"; ln -s "$src" "$dst"
+                printf '    %s→ %s%s\n' "$D" "$item" "$X"
+            else
+                printf '    %s~ %s (not in base yet)%s\n' "$D" "$item" "$X"
+            fi
+        elif [ -e "$dst" ]; then
+            printf '    %s= %s (profile'"'"'s own copy, untouched)%s\n' "$D" "$item" "$X"
+        elif [ -e "$src" ]; then
+            ln -s "$src" "$dst"
+            printf '    %s→ %s%s\n' "$D" "$item" "$X"
+        else
+            printf '    %s~ %s (not in base yet)%s\n' "$D" "$item" "$X"
+        fi
+    done
+}
+
+replace_literal() {   # file old new — literal, no regex
+    local file="$1" old="$2" new="$3"
+    awk -v a="$old" -v b="$new" '{
+        out=""; s=$0
+        while ((i=index(s,a))>0) { out=out substr(s,1,i-1) b; s=substr(s,i+length(a)) }
+        print out s }' "$file" | atomic_write "$file"
+}
+
+# ── Launch (SPEC §5) ────────────────────────────────────────────────────────
+claude_bin() {
+    local bin="${SELVES_CLAUDE_BIN:-}"
+    if [ -z "$bin" ]; then
+        bin="$(command -v claude 2>/dev/null || true)"
+        [ -n "$bin" ] || die "Claude Code not found in PATH."
+    fi
+    [ -x "$bin" ] || die "Not executable: $bin"
+    if [ "$(realpath_of "$bin")" = "$SELF" ]; then
+        die "Recursion: '$bin' is selves itself. Set SELVES_CLAUDE_BIN to the real claude binary."
+    fi
+    echo "$bin"
+}
+
+launch() {
+    local name="$1"; shift
+    profile_exists "$name" || die "Profile '$name' does not exist. Create it with: selves create $name"
+    local bin dir n v
+    bin="$(claude_bin)"
+    dir="$(profile_dir "$name")"
+    if [ -z "${SELVES_QUIET:-}" ]; then
+        for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; do
+            [ -n "${!v:-}" ] && warn "$v is set: it may take precedence over this profile's login."
+        done
+    fi
+    [ -z "${SELVES_NO_REPAIR:-}" ] && repair_json "$dir"
+    n="$(sessions_running "$dir")"
+    if [ "$n" -gt 0 ] && [ -z "${SELVES_QUIET:-}" ]; then
+        info "$n other session(s) already running with '$name' (they share .claude.json)." >&2
+    fi
+    if [ "$name" = "base" ]; then
+        exec env -u CLAUDE_CONFIG_DIR SELVES_ACTIVE_PROFILE=base "$bin" "$@"
+    fi
+    exec env CLAUDE_CONFIG_DIR="$dir" SELVES_ACTIVE_PROFILE="$name" "$bin" "$@"
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+cmd_create() {
+    local name="" bare="" a
+    for a in "$@"; do
+        case "$a" in --bare) bare=1 ;; -*) usage "Unknown option: $a" ;; *) [ -z "$name" ] && name="$a" || usage "Too many arguments." ;; esac
+    done
+    [ -n "$name" ] || usage "Usage: selves create <name> [--bare]"
+    check_new_name "$name"
+    local dir; dir="$(profile_dir "$name")"
+    if [ -e "$dir" ]; then
+        [ -n "$(marker_of "$dir")" ] && die "Profile '$name' already exists."
+        die "$dir exists but is not a profile. To keep its contents, run: selves adopt $name"
+    fi
+    mkdir -p "$dir"; chmod 700 "$dir"
+    if [ -n "$bare" ]; then printf '%s\nbare\n' "$name" > "$dir/$MARKER"; else echo "$name" > "$dir/$MARKER"; fi
+    printf '\n  %sProfile "%s"%s\n' "$B" "$name" "$X"
+    if [ -z "$bare" ]; then link_shared "$dir"; else printf '    %s(bare: nothing shared)%s\n' "$D" "$X"; fi
+    echo
+    ok "Created $dir"
+    info "Log in once with: selves run $name"
+}
+
+cmd_adopt() {
+    [ $# -eq 1 ] || usage "Usage: selves adopt <name>"
+    local name="$1"; check_new_name "$name"
+    local dir; dir="$(profile_dir "$name")"
+    [ -d "$dir" ] || die "$dir does not exist."
+    [ -n "$(marker_of "$dir")" ] && die "$dir is already a profile."
+    echo "$name" > "$dir/$MARKER"; chmod 700 "$dir"
+    ok "Adopted $dir as '$name' (nothing else changed)."
+    info "To link the shared layer: selves relink"
+}
+
+cmd_list() {
+    local def bound="" name dir mark login f
+    def="$(get_default)"
+    if f="$(find_binding_file)"; then bound="$(read_binding_value "$f" || true)"; fi
+    printf '\n  %sProfiles%s\n\n' "$B" "$X"
+    for name in base $(list_profiles); do
+        dir="$(profile_dir "$name")"; login="$(has_login "$dir")"
+        mark="  "
+        [ "$name" = "$def" ] && mark="${Y}★${X} "
+        [ "$name" = "$bound" ] && mark="${G}●${X} "
+        case "$login" in
+            yes) login="${G}logged in${X}" ;; keychain) login="${D}keychain${X}" ;; *) login="${R}no login${X}" ;;
+        esac
+        printf '  %s%-14s %s%-34s%s %s%s\n' "$mark" "$name" "$D" "$(tildify "$dir")" "$X" "$login" \
+            "$(is_bare "$name" 2>/dev/null && echo " ${D}(bare)${X}" || true)"
+    done
+    printf '\n  %s★ default   ● bound here   base = ~/.claude%s\n\n' "$D" "$X"
+}
+
+cmd_status() {
+    resolve_profile
+    printf '\n  %sHere:%s %s%s%s  %s(%s)%s\n' "$B" "$X" "$G" "$RESOLVED" "$X" "$D" "$RESOLVED_HOW" "$X"
+    cmd_list
+}
+
+cmd_delete() {
+    local name="" yes="" a
+    for a in "$@"; do
+        case "$a" in -y|--yes) yes=yes ;; -*) usage "Unknown option: $a" ;; *) name="$a" ;; esac
+    done
+    [ -n "$name" ] || usage "Usage: selves delete <name> [--yes]"
+    [ "$name" = "base" ] && die "The base profile (~/.claude) cannot be deleted."
+    profile_exists "$name" || die "Profile '$name' does not exist."
+    local dir; dir="$(profile_dir "$name")"
+    warn "This removes $dir (sessions, history and login of that profile)."
+    confirm "Delete profile '$name'?" "$yes" || { info "Cancelled."; return 0; }
+    rm -rf -- "$dir"     # rm never follows the shared links into base
+    ok "Deleted $dir"
+}
+
+cmd_bind() {
+    [ $# -eq 1 ] || usage "Usage: selves bind <profile>"
+    local name="$1"
+    profile_exists "$name" || die "Profile '$name' does not exist."
+    echo "$name" | atomic_write "$PWD/$BIND_FILE"
+    ok "$PWD → $name"
+    if git -C "$PWD" rev-parse --git-dir >/dev/null 2>&1; then
+        info "Git repo detected. To keep $BIND_FILE out of commits:"
+        printf '      echo %s >> "$(git rev-parse --git-dir)/info/exclude"\n' "$BIND_FILE"
+    fi
+}
+
+cmd_unbind() {
+    [ -f "$PWD/$BIND_FILE" ] || die "No $BIND_FILE in this directory."
+    rm -f -- "$PWD/$BIND_FILE"; ok "Binding removed from $PWD"
+}
+
+cmd_which() {
+    resolve_profile
+    echo "$RESOLVED"
+    printf '  %s(%s)%s\n' "$D" "$RESOLVED_HOW" "$X" >&2
+}
+
+cmd_run() {
+    [ $# -ge 1 ] || usage "Usage: selves run <name> [--] [args...]"
+    local name="$1"; shift
+    [ "${1:-}" = "--" ] && shift
+    launch "$name" "$@"
+}
+
+cmd_auto() {
+    [ "${1:-}" = "--" ] && shift
+    resolve_profile
+    launch "$RESOLVED" "$@"
+}
+
+cmd_default() {
+    if [ $# -eq 0 ]; then get_default; return 0; fi
+    [ $# -eq 1 ] || usage "Usage: selves default [name]"
+    if [ "$1" = "base" ]; then rm -f -- "$DEFAULT_FILE"; ok "Default profile reset to base"; return 0; fi
+    profile_exists "$1" || die "Profile '$1' does not exist."
+    mkdir -p "$CONF_DIR"
+    echo "$1" | atomic_write "$DEFAULT_FILE"
+    ok "Default profile: $1"
+}
+
+cmd_relink() {
+    local name
+    for name in $(list_profiles); do
+        printf '  %s%s%s\n' "$B" "$name" "$X"
+        if is_bare "$name"; then printf '    %s(bare: skipped)%s\n' "$D" "$X"; continue; fi
+        link_shared "$(profile_dir "$name")"
+    done
+}
+
+cmd_unshare() {
+    [ $# -eq 2 ] || usage "Usage: selves unshare <profile> <item>"
+    local name="$1" item="$2" dir dst src tmp f count=0
+    [ "$name" = "base" ] && die "base is the source of the shared layer."
+    profile_exists "$name" || die "Profile '$name' does not exist."
+    dir="$(profile_dir "$name")"; dst="$dir/$item"
+    [ -L "$dst" ] || die "$dst is not a link (already independent)."
+    src="$(realpath_of "$dst")"
+    [ -e "$src" ] || die "Broken link: $dst"
+    [ "$(sessions_running "$dir")" -gt 0 ] && die "Close the running sessions of '$name' first."
+    tmp="$dst.selves-tmp"
+    rm -rf -- "$tmp"
+    cp -a -- "$src" "$tmp" || { rm -rf -- "$tmp"; die "Copy failed; nothing changed."; }
+    rm -f -- "$dst"; mv -- "$tmp" "$dst"
+    if [ -d "$dst" ]; then
+        while IFS= read -r f; do
+            replace_literal "$f" "$src/" "$dst/"
+            replace_literal "$f" "$src\"" "$dst\""
+            count=$((count+1))
+        done < <(grep -rlF --include='*.json' -- "$src" "$dst" 2>/dev/null || true)
+    fi
+    ok "$item is now owned by '$name' ($count JSON file(s) rewritten)"
+}
+
+cmd_repair() {
+    [ $# -eq 1 ] || usage "Usage: selves repair <profile>"
+    profile_exists "$1" || die "Profile '$1' does not exist."
+    local dir f; dir="$(profile_dir "$1")"; f="$dir/.claude.json"
+    if [ ! -f "$f" ]; then info "$1 has no .claude.json"; return 0; fi
+    if json_ok "$f"; then ok "$f is valid."; else repair_json "$dir"; fi
+}
+
+# ── doctor (SPEC §8.11) ─────────────────────────────────────────────────────
+DOC_WARN=0
+dwarn() { printf '  %s!%s  %-22s %s\n' "$Y" "$X" "$1" "$2"; DOC_WARN=$((DOC_WARN+1)); }
+dinfo() { printf '  %si%s  %-22s %s\n' "$C" "$X" "$1" "$2"; }
+derr()  { printf '  %s✘%s  %-22s %s\n' "$R" "$X" "$1" "$2"; DOC_WARN=$((DOC_WARN+1)); }
+
+rc_files() {
+    local f
+    for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc" \
+             "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.config/fish/config.fish"; do
+        [ -f "$f" ] && echo "$f"
+    done
+    return 0
+}
+
+cmd_doctor() {
+    local f line name dir p item v bfile
+    printf '\n  %sselves doctor%s\n\n' "$B" "$X"
+
+    if [ -n "${SELVES_CLAUDE_BIN:-}" ] || command -v claude >/dev/null 2>&1; then :; else
+        derr CLAUDE_NOT_FOUND "Claude Code not found in PATH."
+    fi
+    [ -n "${CLAUDE_CONFIG_DIR:-}" ] && dwarn ENV_CONFIG_DIR_SET "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR in this shell; remove the export."
+    while IFS= read -r f; do
+        while IFS= read -r line; do
+            dwarn RC_CONFIG_DIR_EXPORT "$(tildify "$f"):${line} — remove this line."
+        done < <(grep -nE '^[[:space:]]*(export[[:space:]]+|set[[:space:]]+-gx[[:space:]]+)CLAUDE_CONFIG_DIR' "$f" 2>/dev/null | cut -d: -f1 || true)
+        grep -qxF "$LEGACY_RC_BEGIN" "$f" 2>/dev/null && dwarn LEGACY_RC_BLOCK "$(tildify "$f") has a claude-switch block — run: selves migrate"
+    done < <(rc_files)
+    for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; do
+        [ -n "${!v:-}" ] && dwarn ENV_API_KEY "$v is set; unset it if you use account login."
+    done
+
+    for name in $(list_profiles); do
+        dir="$(profile_dir "$name")"
+        [ -f "$dir/$LEGACY_MARKER" ] && [ ! -f "$dir/$MARKER" ] && dwarn LEGACY_MARKER "$name uses .profile-name — run: selves migrate"
+        p="$(perms "$dir")"; [ "$p" != "700" ] && dwarn PROFILE_PERMS "$name: directory mode $p — chmod 700 $dir"
+        if [ -f "$dir/.credentials.json" ]; then
+            p="$(perms "$dir/.credentials.json")"; [ "$p" != "600" ] && dwarn CREDS_PERMS "$name: .credentials.json mode $p — chmod 600"
+        fi
+        for item in "$dir"/* "$dir"/.[!.]*; do
+            [ -L "$item" ] && [ ! -e "$item" ] && dwarn BROKEN_LINK "$name: ${item##*/} — run: selves relink"
+        done
+        if ! is_bare "$name"; then
+            for item in $SHARED_ITEMS; do
+                [ -e "$CLAUDE_HOME/$item" ] && [ ! -e "$dir/$item" ] && [ ! -L "$dir/$item" ] \
+                    && dwarn MISSING_SHARED "$name: $item — run: selves relink"
+            done
+        fi
+        [ -L "$dir/settings.json" ] && dwarn SHARED_SETTINGS "$name: settings.json is shared; give the profile its own file."
+        [ -L "$dir/plugins" ] && dwarn SHARED_PLUGINS "$name: plugins is shared — run: selves unshare $name plugins"
+        if [ -f "$dir/.claude.json" ] && ! json_ok "$dir/.claude.json"; then
+            dwarn CORRUPT_JSON "$name: .claude.json is corrupt — run: selves repair $name"
+        fi
+    done
+
+    [ -f "$LEGACY_DEFAULT_FILE" ] && [ ! -f "$DEFAULT_FILE" ] && dwarn LEGACY_CONFIG "claude-switch default file found — run: selves migrate"
+    if bfile="$(find_binding_file)"; then
+        [ "${bfile##*/}" = "$LEGACY_BIND_FILE" ] && dwarn LEGACY_BINDING "$bfile — run: selves migrate"
+        dinfo BINDING "$(read_binding_value "$bfile" || true) ($bfile)"
+    fi
+    [ -f "$CLAUDE_HOME/.credentials.json" ] && dinfo BASE_HAS_LOGIN "base (${CLAUDE_HOME}) has its own login; IDE extensions and scripts use it."
+    dinfo DEFAULT_PROFILE "$(get_default)"
+
+    echo
+    if [ "$DOC_WARN" -eq 0 ]; then ok "No problems found."; echo; return 0; fi
+    printf '  %s%d finding(s).%s\n\n' "$Y" "$DOC_WARN" "$X"
+    return 3
+}
+
+# ── init (SPEC §8.12) ───────────────────────────────────────────────────────
+shell_quote() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
+
+cmd_init() {
+    local shell="" wrapper=1 a name q
+    for a in "$@"; do
+        case "$a" in --no-wrapper) wrapper="" ;; bash|zsh) shell="$a" ;; fish|powershell) die "'$a' is supported by the full edition of selves." ;; *) usage "Usage: selves init <bash|zsh> [--no-wrapper]" ;; esac
+    done
+    [ -n "$shell" ] || usage "Usage: selves init <bash|zsh> [--no-wrapper]"
+    q="$(shell_quote "$SELF")"
+    echo "# selves-lite $VERSION shell integration ($shell)"
+    if [ -n "$wrapper" ]; then
+        echo "unalias claude 2>/dev/null"
+        echo "claude() { $q auto -- \"\$@\"; }"
+    fi
+    for name in $(list_profiles); do
+        echo "unalias claude-$name 2>/dev/null"
+        echo "claude-$name() { $q run $name -- \"\$@\"; }"
+    done
+}
+
+# ── migrate (SPEC §8.13) ────────────────────────────────────────────────────
+cmd_migrate() {
+    local yes="" root="$HOME" a d f rc
+    while [ $# -gt 0 ]; do
+        case "$1" in -y|--yes) yes=yes ;; --root) shift; root="${1:?--root needs a directory}" ;; *) usage "Usage: selves migrate [--yes] [--root <dir>]" ;; esac
+        shift
+    done
+    local markers=() binds=() rcs=() do_default=""
+    for d in "${PREFIX}"*/; do
+        d="${d%/}"
+        [ -f "$d/$LEGACY_MARKER" ] && [ ! -f "$d/$MARKER" ] && markers+=("$d")
+    done
+    while IFS= read -r f; do binds+=("$f"); done < <(find "$root" -maxdepth 6 -name "$LEGACY_BIND_FILE" \
+        -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null || true)
+    [ -f "$LEGACY_DEFAULT_FILE" ] && [ ! -f "$DEFAULT_FILE" ] && do_default=1
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [ -f "$rc" ] && grep -qxF "$LEGACY_RC_BEGIN" "$rc" && rcs+=("$rc")
+    done
+
+    local total=$(( ${#markers[@]} + ${#binds[@]} + ${#rcs[@]} )) 
+    [ -n "$do_default" ] && total=$((total+1))
+    if [ "$total" -eq 0 ]; then ok "Nothing to migrate."; return 0; fi
+
+    printf '\n  %sMigration plan%s\n\n' "$B" "$X"
+    for d in ${markers[@]+"${markers[@]}"}; do echo "    marker   $(tildify "$d")/$LEGACY_MARKER → $MARKER"; done
+    for f in ${binds[@]+"${binds[@]}"};   do echo "    binding  $(tildify "$f") → $BIND_FILE"; done
+    [ -n "$do_default" ] && echo "    default  $(tildify "$LEGACY_DEFAULT_FILE") → $(tildify "$DEFAULT_FILE")"
+    for rc in ${rcs[@]+"${rcs[@]}"};     do echo "    rc       remove claude-switch block from $(tildify "$rc") (backup: .selves.bak)"; done
+    echo
+    confirm "Apply these $total change(s)?" "$yes" || { info "Cancelled."; return 0; }
+
+    for d in ${markers[@]+"${markers[@]}"}; do mv -- "$d/$LEGACY_MARKER" "$d/$MARKER"; done
+    for f in ${binds[@]+"${binds[@]}"}; do
+        if [ -f "$(dirname "$f")/$BIND_FILE" ]; then rm -f -- "$f"; else mv -- "$f" "$(dirname "$f")/$BIND_FILE"; fi
+    done
+    if [ -n "$do_default" ]; then mkdir -p "$CONF_DIR"; cp -- "$LEGACY_DEFAULT_FILE" "$DEFAULT_FILE"; fi
+    for rc in ${rcs[@]+"${rcs[@]}"}; do
+        backup_once "$rc" ".selves.bak"
+        awk -v b="$LEGACY_RC_BEGIN" -v e="$LEGACY_RC_END" '$0==b{s=1;next} $0==e{s=0;next} !s' "$rc" | atomic_write "$rc"
+    done
+    ok "Migrated $total item(s)."
+    if [ ${#rcs[@]} -gt 0 ]; then
+        info "Add this line to your shell startup file instead:"
+        printf '      eval "$(selves init %s)"\n' "$(basename "${SHELL:-bash}")"
+    fi
+}
+
+cmd_dotfiles() {   # SPEC §8.14: delegate to the companion script
+    local c
+    c="$(dirname "$SELF")/selves-dotfiles"
+    [ -x "$c" ] || c="$(command -v selves-dotfiles 2>/dev/null || true)"
+    [ -n "$c" ] || die "selves-dotfiles not found. Install it next to selves (same folder) or in PATH."
+    exec "$c" "$@"
+}
+
+cmd_help() {
+    cat <<EOF
+
+  ${B}selves-lite${X} $VERSION — Manage your selves in Claude Code.
+
+  ${B}USE${X}
+    selves                      Which profile applies here, and all profiles
+    selves <name> [args]        Launch Claude Code with a profile ('base' = ~/.claude)
+    selves run <name> [-- args] Same, explicit form
+    selves auto [-- args]       Launch the profile bound to this folder (or the default)
+
+  ${B}PROFILES${X}
+    create <name> [--bare]      New profile at ~/.claude-<name>
+    adopt <name>                Turn an existing ~/.claude-<name> into a profile
+    list                        List profiles and login status
+    delete <name> [--yes]       Delete a profile
+    default [name]              Show or set the default profile ('base' resets)
+
+  ${B}FOLDERS${X}
+    bind <name>                 This folder (and below) uses <name>
+    unbind                      Remove this folder's binding
+    which                       Print the profile that applies here
+
+  ${B}SHARED LAYER${X}  (${SHARED_ITEMS})
+    relink                      Re-create shared links
+    unshare <profile> <item>    Turn a shared link into the profile's own copy
+
+  ${B}HEALTH${X}
+    doctor                      Detect known conflicts (exit 3 if any)
+    repair <profile>            Restore a corrupt .claude.json from backups/
+    migrate [--yes]             Convert a claude-switch setup
+
+  ${B}BACKUP${X}  (companion script selves-dotfiles)
+    dotfiles export|install|backup-history|restore-history
+
+  ${B}SHELL${X}
+    init <bash|zsh> [--no-wrapper]
+                                Add to your startup file:  eval "\$(selves init bash)"
+
+EOF
+}
+
+main() {
+    case "${1:-}" in
+        "")                cmd_status ;;
+        status)            cmd_status ;;
+        create)            shift; cmd_create "$@" ;;
+        adopt)             shift; cmd_adopt "$@" ;;
+        list|ls)           cmd_list ;;
+        delete|rm|remove)  shift; cmd_delete "$@" ;;
+        bind)              shift; cmd_bind "$@" ;;
+        unbind)            cmd_unbind ;;
+        which)             cmd_which ;;
+        run|launch)        shift; cmd_run "$@" ;;
+        auto)              shift; cmd_auto "$@" ;;
+        default)           shift; cmd_default "$@" ;;
+        relink)            cmd_relink ;;
+        unshare)           shift; cmd_unshare "$@" ;;
+        repair)            shift; cmd_repair "$@" ;;
+        doctor)            cmd_doctor ;;
+        init)              shift; cmd_init "$@" ;;
+        migrate)           shift; cmd_migrate "$@" ;;
+        dotfiles)          shift; cmd_dotfiles "$@" ;;
+        help|-h|--help)    cmd_help ;;
+        version|-v|--version) echo "selves-lite $VERSION" ;;
+        -*)                usage "Unknown option: $1 (see: selves help)" ;;
+        *)
+            if profile_exists "$1"; then launch "$@"
+            else err "Unknown command or profile: $1"; cmd_help >&2; exit 2; fi ;;
+    esac
+}
+
+main "$@"

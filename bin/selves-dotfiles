@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# selves-dotfiles — companion of selves-lite (SPEC.md §8.14).
+# Exports your selves setup to a git repository and rebuilds it elsewhere.
+# Usually invoked as:  selves dotfiles <export|install|backup-history|restore-history>
+#
+# Never exported: credentials, .claude.json, history, caches, sessions.
+# ─────────────────────────────────────────────────────────────────────────────
+# shellcheck disable=SC2088  # "~" in messages is display text, not a path
+set -euo pipefail
+
+VERSION="1.0.0"
+CLAUDE_HOME="$HOME/.claude"
+PREFIX="$HOME/.claude-"
+MARKER=".selves-profile"
+LEGACY_MARKER=".profile-name"
+SHARED_ITEMS="${SELVES_SHARED:-CLAUDE.md skills rules agents commands}"
+SEARCH_DEPTH="${SELVES_DOTFILES_DEPTH:-6}"
+CLAUDE_BIN="${SELVES_CLAUDE_BIN:-claude}"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[0;33m'; C=$'\033[0;36m'; B=$'\033[1m'; D=$'\033[2m'; X=$'\033[0m'
+else R=""; G=""; Y=""; C=""; B=""; D=""; X=""; fi
+ok()    { printf '  %s✔%s  %s\n' "$G" "$X" "$*"; }
+info()  { printf '  %s▶%s  %s\n' "$C" "$X" "$*"; }
+warn()  { printf '  %s!%s  %s\n' "$Y" "$X" "$*" >&2; }
+die()   { printf '  %s✘%s  %s\n' "$R" "$X" "$*" >&2; exit 1; }
+usage() { printf '  %s✘%s  %s\n' "$R" "$X" "$*" >&2; exit 2; }
+
+realpath_of() {
+    realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null \
+      || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || echo "$1"
+}
+SELF="$(realpath_of "${BASH_SOURCE[0]}")"
+has_python() { command -v python3 >/dev/null 2>&1; }
+
+find_selves() {
+    local here; here="$(dirname "$SELF")/selves"
+    if [ -x "$here" ]; then echo "$here"; return 0; fi
+    command -v selves 2>/dev/null || return 1
+}
+
+# ── Profiles (same rules as selves) ─────────────────────────────────────────
+marker_of() {
+    if [ -f "$1/$MARKER" ]; then echo "$1/$MARKER"
+    elif [ -f "$1/$LEGACY_MARKER" ]; then echo "$1/$LEGACY_MARKER"; fi
+}
+list_profiles() {
+    local d n
+    for d in "${PREFIX}"*/; do
+        [ -d "$d" ] || continue
+        [ -n "$(marker_of "${d%/}")" ] || continue
+        n="${d%/}"; n="${n##*/}"; echo "${n#.claude-}"
+    done
+}
+is_bare() { local m; m="$(marker_of "${PREFIX}$1")"; [ -n "$m" ] && sed -n 2p "$m" | grep -qx bare; }
+
+claude_running() {
+    local p exe
+    if [ -d /proc ]; then
+        for p in /proc/[0-9]*; do
+            [ -O "$p" ] || continue
+            exe="$(readlink "$p/exe" 2>/dev/null || true)"
+            [ "${exe##*/}" = "claude" ] && return 0
+        done
+        return 1
+    fi
+    pgrep -u "$(id -u)" -x claude >/dev/null 2>&1
+}
+
+read_value() { awk 'NF && $0 !~ /^[[:space:]]*#/ { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }' "$1"; }
+
+mirror() {   # copy src → dst, replacing dst; follows links
+    [ -e "$1" ] || return 0
+    rm -rf -- "$2"; cp -RL -- "$1" "$2"
+}
+backup_once() { [ -e "$1" ] && [ ! -e "$1$2" ] && mv -- "$1" "$1$2"; return 0; }
+
+# ── Account state: settings, user MCP servers, marketplaces ────────────────
+export_account() {   # $1 = config dir, $2 = output dir, $3 = "mcp" to export MCP
+    local src="$1" out="$2"
+    mkdir -p "$out"
+    [ -f "$src/settings.json" ] && cp "$src/settings.json" "$out/settings.json"
+    has_python || return 0
+    if [ "${3:-}" = "mcp" ] && [ -f "$src/.claude.json" ]; then
+        python3 - "$src/.claude.json" "$out/mcp.json" <<'PY'
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+m = d.get("mcpServers") or {}
+if m: json.dump(m, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
+PY
+    fi
+    if [ -f "$src/plugins/known_marketplaces.json" ]; then
+        python3 - "$src/plugins/known_marketplaces.json" "$out/marketplaces.json" <<'PY'
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+out = {k: (v.get("source") if isinstance(v, dict) else v) for k, v in d.items()}
+if out: json.dump(out, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
+PY
+    fi
+    return 0
+}
+
+install_mcp() {   # $1 = mcp.json, $2 = config dir ("" = base)
+    [ -f "$1" ] || return 0
+    has_python || { warn "  python3 missing: MCP servers in $1 not installed"; return 0; }
+    local name json
+    while IFS=$'\t' read -r name json; do
+        if [ -n "$2" ]; then
+            CLAUDE_CONFIG_DIR="$2" "$CLAUDE_BIN" mcp add-json -s user "$name" "$json" >/dev/null 2>&1
+        else
+            env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" mcp add-json -s user "$name" "$json" >/dev/null 2>&1
+        fi && info "  MCP: $name" || warn "  MCP '$name' could not be added; check it with /mcp"
+    done < <(python3 -c 'import json,sys
+for k,v in json.load(open(sys.argv[1])).items(): print(k+"\t"+json.dumps(v))' "$1")
+}
+
+print_manual() {   # $1 = profile label, $2 = exported dir
+    printf '\n    %sselves run %s%s   → log in, then in /plugin:\n' "$B" "$1" "$X"
+    has_python || { echo "      (python3 missing: see $2/settings.json and marketplaces.json)"; return 0; }
+    [ -f "$2/marketplaces.json" ] && python3 -c 'import json,sys
+for k,v in json.load(open(sys.argv[1])).items():
+    src = (v.get("repo") or v.get("url") or v.get("path")) if isinstance(v, dict) else v
+    print("      marketplace add", src, "  #", k)' "$2/marketplaces.json"
+    [ -f "$2/settings.json" ] && python3 -c 'import json,sys
+try: s = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for k,v in (s.get("enabledPlugins") or {}).items():
+    if v: print("      install", k)' "$2/settings.json"
+    return 0
+}
+
+# ── export ──────────────────────────────────────────────────────────────────
+cmd_export() {
+    [ $# -le 1 ] || usage "Usage: selves dotfiles export [dir]"
+    local D="${1:-$HOME/selves-dotfiles}" sv item name dir P f n rel val
+    mkdir -p "$D/bin"
+    printf '\n  %sExporting to %s%s\n\n' "$B" "$D" "$X"
+
+    if sv="$(find_selves)"; then cp "$sv" "$D/bin/selves"; ok "bin/selves"; else warn "selves not found; copy it to $D/bin/ yourself"; fi
+    cp "$SELF" "$D/bin/selves-dotfiles"; ok "bin/selves-dotfiles"
+
+    rm -rf -- "$D/base"; mkdir -p "$D/base/shared"
+    for item in $SHARED_ITEMS; do
+        if [ -e "$CLAUDE_HOME/$item" ]; then mirror "$CLAUDE_HOME/$item" "$D/base/shared/$item"; ok "base/shared/$item"; fi
+    done
+    if [ -f "$CLAUDE_HOME/.credentials.json" ]; then
+        touch "$D/base/account"; export_account "$CLAUDE_HOME" "$D/base" mcp
+        info "base has its own login: its MCP servers and plugins are exported too"
+    else
+        export_account "$CLAUDE_HOME" "$D/base"
+    fi
+
+    rm -rf -- "$D/profiles"; mkdir -p "$D/profiles"
+    for name in $(list_profiles); do
+        dir="$PREFIX$name"; P="$D/profiles/$name"; mkdir -p "$P"; : > "$P/modes"
+        is_bare "$name" && touch "$P/bare"
+        for item in $SHARED_ITEMS; do
+            if [ -L "$dir/$item" ]; then
+                echo "$item shared" >> "$P/modes"
+            elif [ -d "$dir/$item" ]; then
+                echo "$item own" >> "$P/modes"; mkdir -p "$P/own/$item"
+                for f in "$dir/$item"/* "$dir/$item"/.[!.]*; do
+                    [ -e "$f" ] || [ -L "$f" ] || continue
+                    if [ -L "$f" ] && [[ "$(realpath_of "$f")" == "$(realpath_of "$CLAUDE_HOME/$item")"/* ]]; then continue; fi
+                    [ -e "$f" ] && cp -RL -- "$f" "$P/own/$item/"
+                done
+            elif [ -f "$dir/$item" ]; then
+                echo "$item own" >> "$P/modes"; mkdir -p "$P/own"; cp -L "$dir/$item" "$P/own/$item"
+            fi
+        done
+        export_account "$dir" "$P" mcp
+        ok "profiles/$name$(is_bare "$name" && echo " (bare)" || true)"
+    done
+
+    rm -f "$D/default"
+    if sv="$(find_selves)"; then
+        val="$("$sv" default 2>/dev/null || true)"
+        [ -n "$val" ] && [ "$val" != "base" ] && echo "$val" > "$D/default"
+    fi
+
+    : > "$D/bindings.txt"
+    while IFS= read -r f; do
+        val="$(read_value "$f" || true)"; [ -n "$val" ] || continue
+        rel="$(dirname "$f")"
+        case "$rel" in "$HOME"/*) rel="${rel#"$HOME"/}" ;; esac
+        grep -q "^${rel}	" "$D/bindings.txt" 2>/dev/null && continue   # .selves wins over legacy
+        printf '%s\t%s\n' "$rel" "$val" >> "$D/bindings.txt"
+    done < <( { find "$HOME" -maxdepth "$SEARCH_DEPTH" -name .selves -type f -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null
+                find "$HOME" -maxdepth "$SEARCH_DEPTH" -name .claude-profile -type f -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null; } || true)
+    ok "bindings.txt ($(wc -l < "$D/bindings.txt" | tr -d ' ') folder(s))"
+
+    [ -f "$D/.gitignore" ] || printf '*.tgz\n.env\n' > "$D/.gitignore"
+
+    echo
+    local hits
+    hits="$(grep -rnoiE '"[^"]*(key|token|secret|password|authorization)[^"]*"[[:space:]]*:[[:space:]]*"[^"$]{8,}' \
+            "$D" --include='*.json' 2>/dev/null | cut -c1-160 || true)"
+    if [ -n "$hits" ]; then
+        warn "Possible secrets — replace them with environment variables before pushing:"
+        printf '%s\n' "$hits" | sed 's/^/      /' >&2
+    else
+        ok "No obvious secrets found"
+    fi
+    for P in "$D"/profiles/*/; do
+        [ -d "$P/own" ] && warn "$(basename "$P"): profiles/$(basename "$P")/own may contain organization-owned material; keep the repo private."
+    done
+    echo
+    info "Next: cd $D && git init && git add -A && git commit -m 'selves setup'   (PRIVATE repo)"
+    echo
+}
+
+# ── install ─────────────────────────────────────────────────────────────────
+cmd_install() {
+    local D="$HOME/selves-dotfiles" no_init="" a
+    for a in "$@"; do case "$a" in --no-init) no_init=1 ;; -*) usage "Unknown option: $a" ;; *) D="$a" ;; esac; done
+    [ -d "$D/base" ] || die "$D/base not found. Clone your dotfiles repository first."
+    command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "Install Claude Code first, then run this again."
+    claude_running && die "Close all Claude Code sessions before installing."
+    has_python || warn "python3 not found: MCP servers and the plugin checklist will be skipped."
+    printf '\n  %sInstalling from %s%s\n\n' "$B" "$D" "$X"
+
+    local sv
+    mkdir -p "$HOME/.local/bin"
+    if [ -f "$D/bin/selves" ]; then
+        install -m 755 "$D/bin/selves" "$HOME/.local/bin/selves"
+        [ -f "$D/bin/selves-dotfiles" ] && install -m 755 "$D/bin/selves-dotfiles" "$HOME/.local/bin/selves-dotfiles"
+        ok "selves → ~/.local/bin"
+        sv="$HOME/.local/bin/selves"
+    else
+        sv="$(find_selves)" || die "selves not found (neither in the repository nor in PATH)."
+    fi
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "~/.local/bin is not in PATH; add: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;; esac
+
+    local item P name dir mode s rel prof target pending=0
+    mkdir -p "$CLAUDE_HOME"
+    for item in $SHARED_ITEMS; do
+        [ -e "$D/base/shared/$item" ] || continue
+        backup_once "$CLAUDE_HOME/$item" ".pre-selves"; mirror "$D/base/shared/$item" "$CLAUDE_HOME/$item"
+        ok "~/.claude/$item"
+    done
+    if [ -f "$D/base/settings.json" ]; then
+        backup_once "$CLAUDE_HOME/settings.json" ".pre-selves"; cp "$D/base/settings.json" "$CLAUDE_HOME/settings.json"
+        ok "~/.claude/settings.json"
+    fi
+    install_mcp "$D/base/mcp.json" ""
+
+    for P in "$D"/profiles/*/; do
+        [ -d "$P" ] || continue
+        P="${P%/}"; name="${P##*/}"; dir="$PREFIX$name"
+        if [ -n "$(marker_of "$dir")" ]; then
+            info "Profile '$name' exists; updating"
+        elif [ -d "$dir" ]; then
+            "$sv" adopt "$name" >/dev/null; ok "Profile '$name' adopted"
+        elif [ -f "$P/bare" ]; then
+            "$sv" create "$name" --bare >/dev/null; ok "Profile '$name' created (bare)"
+        else
+            "$sv" create "$name" >/dev/null; ok "Profile '$name' created"
+        fi
+        if [ -f "$P/settings.json" ]; then
+            backup_once "$dir/settings.json" ".pre-selves"; cp "$P/settings.json" "$dir/settings.json"
+        fi
+        if [ -f "$P/modes" ]; then
+            while read -r item mode; do
+                case "$mode" in
+                    shared)
+                        [ -f "$P/bare" ] && continue
+                        if [ ! -e "$dir/$item" ] && [ ! -L "$dir/$item" ] && [ -e "$CLAUDE_HOME/$item" ]; then ln -s "$CLAUDE_HOME/$item" "$dir/$item"; fi ;;
+                    own)
+                        [ -L "$dir/$item" ] && rm -f -- "$dir/$item"
+                        if [ -d "$P/own/$item" ]; then
+                            mkdir -p "$dir/$item"
+                            cp -R "$P/own/$item/." "$dir/$item/"
+                            for s in "$CLAUDE_HOME/$item"/* "$CLAUDE_HOME/$item"/.[!.]*; do
+                                [ -e "$s" ] || continue
+                                [ -e "$dir/$item/${s##*/}" ] || ln -s "$s" "$dir/$item/${s##*/}"
+                            done
+                            info "  $item: own + links to shared entries"
+                        elif [ -f "$P/own/$item" ]; then
+                            cp "$P/own/$item" "$dir/$item"; info "  $item: own"
+                        fi ;;
+                esac
+            done < "$P/modes"
+        fi
+        install_mcp "$P/mcp.json" "$dir"
+    done
+
+    if [ -s "$D/default" ]; then
+        "$sv" default "$(head -n1 "$D/default")" >/dev/null 2>&1 && ok "Default profile: $(head -n1 "$D/default")" \
+            || warn "Could not set the default profile"
+    fi
+
+    if [ -s "$D/bindings.txt" ]; then
+        while IFS=$'\t' read -r rel prof; do
+            [ -n "$rel" ] || continue
+            case "$rel" in /*) target="$rel" ;; *) target="$HOME/$rel" ;; esac
+            if [ -d "$target" ]; then echo "$prof" > "$target/.selves"; ok "bind $target → $prof"
+            else warn "pending: $target → $prof (clone it, then run install again)"; pending=$((pending+1)); fi
+        done < "$D/bindings.txt"
+    fi
+
+    if [ -z "$no_init" ]; then
+        local shell rc
+        shell="$(basename "${SHELL:-bash}")"
+        case "$shell" in bash) rc="$HOME/.bashrc" ;; zsh) rc="$HOME/.zshrc" ;; *) rc="" ;; esac
+        if [ -z "$rc" ]; then
+            warn "Shell '$shell' not handled: add the selves init line yourself (see: selves help)."
+        elif grep -q 'selves init' "$rc" 2>/dev/null; then
+            info "Shell integration already in ${rc/#$HOME\//\~/}"
+        else
+            [ -f "$rc" ] && [ ! -e "$rc.selves.bak" ] && cp -p "$rc" "$rc.selves.bak"
+            printf '\n# selves\neval "$(selves init %s)"\n' "$shell" >> "$rc"
+            ok "Shell integration added to ~/${rc##*/}"
+        fi
+    fi
+
+    echo
+    echo "  Manual steps:"
+    [ -f "$D/base/account" ] && print_manual base "$D/base"
+    for P in "$D"/profiles/*/; do [ -d "$P" ] && print_manual "$(basename "$P")" "${P%/}"; done
+    echo
+    info "Open a new shell, then check everything with: selves doctor"
+    [ "$pending" -gt 0 ] && info "$pending folder binding(s) pending."
+    echo
+}
+
+# ── history ─────────────────────────────────────────────────────────────────
+cmd_backup_history() {
+    [ $# -le 1 ] || usage "Usage: selves dotfiles backup-history [file]"
+    local out="${1:-$HOME/selves-history-$(date +%F).tgz}" d rel f items=()
+    for d in "$CLAUDE_HOME" $(for n in $(list_profiles); do echo "$PREFIX$n"; done); do
+        rel="${d#"$HOME"/}"
+        for f in projects plans history.jsonl; do [ -e "$d/$f" ] && items+=("$rel/$f"); done
+    done
+    [ "${#items[@]}" -gt 0 ] || die "No history to back up."
+    claude_running && warn "Claude Code sessions are running; the archive may be incomplete."
+    (umask 077; tar czf "$out" -C "$HOME" "${items[@]}")
+    chmod 600 "$out"
+    ok "History saved to $out ($(du -h "$out" | cut -f1)). It contains code and conversations: keep it private and out of git."
+}
+
+cmd_restore_history() {
+    [ $# -eq 1 ] && [ -f "$1" ] || usage "Usage: selves dotfiles restore-history <archive.tgz>"
+    claude_running && die "Close all Claude Code sessions before restoring."
+    local bad
+    bad="$(tar tzf "$1" | grep -vE '^\.claude(-[A-Za-z][A-Za-z0-9_-]*)?(/|$)' || true)"
+    [ -z "$bad" ] && bad="$(tar tzf "$1" | grep -E '(^|/)\.\.(/|$)' || true)"
+    [ -n "$bad" ] && die "Archive contains unexpected paths; nothing restored. First one: $(printf '%s\n' "$bad" | head -n1)"
+    tar xzf "$1" -C "$HOME"
+    ok "History restored (existing files with the same names were overwritten)."
+}
+
+cmd_help() {
+    cat <<EOF
+
+  ${B}selves-dotfiles${X} $VERSION — back up and rebuild your selves setup
+
+    selves dotfiles export [dir]               Export to a git-ready folder (default ~/selves-dotfiles)
+    selves dotfiles install [dir] [--no-init]  Rebuild everything on this machine
+    selves dotfiles backup-history [file]      Archive history and conversations (mode 0600)
+    selves dotfiles restore-history <file>     Restore that archive
+
+EOF
+}
+
+case "${1:-}" in
+    export)          shift; cmd_export "$@" ;;
+    install)         shift; cmd_install "$@" ;;
+    backup-history)  shift; cmd_backup_history "$@" ;;
+    restore-history) shift; cmd_restore_history "$@" ;;
+    version|--version|-v) echo "selves-dotfiles $VERSION" ;;
+    help|-h|--help|"") cmd_help ;;
+    *) usage "Unknown subcommand: $1 (see: selves dotfiles help)" ;;
+esac

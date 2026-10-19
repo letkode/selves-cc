@@ -1,0 +1,20 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  lite:
+    name: selves-lite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install bats-core shellcheck; else sudo apt-get update && sudo apt-get install -y bats shellcheck; fi
+      - name: Lint
+        run: shellcheck -S warning bin/selves bin/selves-dotfiles
+      - name: Acceptance suite (core)
+        run: SELVES_BIN="$PWD/bin/selves" bats --filter-tags core tests/
