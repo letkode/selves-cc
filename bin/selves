@@ -421,13 +421,17 @@ cmd_relink() {
 
 cmd_unshare() {
     [ $# -eq 2 ] || usage "Usage: selves unshare <profile> <item>"
-    local name="$1" item="$2" dir dst src tmp f count=0
+    local name="$1" item="$2" dir dst src raw tmp f old count=0
     [ "$name" = "base" ] && die "base is the source of the shared layer."
     profile_exists "$name" || die "Profile '$name' does not exist."
     dir="$(profile_dir "$name")"; dst="$dir/$item"
     [ -L "$dst" ] || die "$dst is not a link (already independent)."
     src="$(realpath_of "$dst")"
     [ -e "$src" ] || die "Broken link: $dst"
+    # The link target as written (e.g. /var/...) can differ from its resolved
+    # form (e.g. /private/var/... on macOS); JSON files may contain either.
+    raw="$(readlink "$dst")"; raw="${raw%/}"
+    case "$raw" in /*) ;; *) raw="$dir/$raw" ;; esac
     [ "$(sessions_running "$dir")" -gt 0 ] && die "Close the running sessions of '$name' first."
     tmp="$dst.selves-tmp"
     rm -rf -- "$tmp"
@@ -435,10 +439,12 @@ cmd_unshare() {
     rm -f -- "$dst"; mv -- "$tmp" "$dst"
     if [ -d "$dst" ]; then
         while IFS= read -r f; do
-            replace_literal "$f" "$src/" "$dst/"
-            replace_literal "$f" "$src\"" "$dst\""
+            for old in "$raw" "$src"; do
+                replace_literal "$f" "$old/" "$dst/"
+                replace_literal "$f" "$old\"" "$dst\""
+            done
             count=$((count+1))
-        done < <(grep -rlF --include='*.json' -- "$src" "$dst" 2>/dev/null || true)
+        done < <(grep -rlF --include='*.json' -e "$raw" -e "$src" -- "$dst" 2>/dev/null || true)
     fi
     ok "$item is now owned by '$name' ($count JSON file(s) rewritten)"
 }
