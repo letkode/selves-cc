@@ -9,7 +9,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 CLAUDE_HOME="$HOME/.claude"
 PREFIX="$HOME/.claude-"
 MARKER=".selves-profile"
