@@ -17,6 +17,7 @@ LEGACY_MARKER=".profile-name"
 SHARED_ITEMS="${SELVES_SHARED:-CLAUDE.md skills rules agents commands}"
 SEARCH_DEPTH="${SELVES_DOTFILES_DEPTH:-6}"
 CLAUDE_BIN="${SELVES_CLAUDE_BIN:-claude}"
+PER_ACCOUNT="skills/synced"   # never exported: Claude Code re-syncs it per account (SPEC §6.6)
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[0;33m'; C=$'\033[0;36m'; B=$'\033[1m'; D=$'\033[2m'; X=$'\033[0m'
@@ -132,10 +133,21 @@ for k,v in (s.get("enabledPlugins") or {}).items():
     return 0
 }
 
+# True if a profile directory holds at least one link into base's same item
+has_base_links() {
+    local l base
+    base="$(realpath_of "$CLAUDE_HOME/$2")"
+    for l in "$1"/* "$1"/.[!.]*; do
+        [ -L "$l" ] || continue
+        [[ "$(realpath_of "$l")" == "$base"/* ]] && return 0
+    done
+    return 1
+}
+
 # ── export ──────────────────────────────────────────────────────────────────
 cmd_export() {
     [ $# -le 1 ] || usage "Usage: selves dotfiles export [dir]"
-    local D="${1:-$HOME/selves-dotfiles}" sv item name dir P f n rel val
+    local D="${1:-$HOME/selves-dotfiles}" sv item name dir P f n rel val pa
     mkdir -p "$D/bin"
     printf '\n  %sExporting to %s%s\n\n' "$B" "$D" "$X"
 
@@ -146,6 +158,7 @@ cmd_export() {
     for item in $SHARED_ITEMS; do
         if [ -e "$CLAUDE_HOME/$item" ]; then mirror "$CLAUDE_HOME/$item" "$D/base/shared/$item"; ok "base/shared/$item"; fi
     done
+    for pa in $PER_ACCOUNT; do rm -rf -- "${D:?}/base/shared/$pa"; done
     if [ -f "$CLAUDE_HOME/.credentials.json" ]; then
         touch "$D/base/account"; export_account "$CLAUDE_HOME" "$D/base" mcp
         info "base has its own login: its MCP servers and plugins are exported too"
@@ -161,7 +174,13 @@ cmd_export() {
             if [ -L "$dir/$item" ]; then
                 echo "$item shared" >> "$P/modes"
             elif [ -d "$dir/$item" ]; then
-                echo "$item own" >> "$P/modes"; mkdir -p "$P/own/$item"
+                if { [ -f "$dir/.selves-entries" ] && grep -qxF "$item" "$dir/.selves-entries"; } \
+                   || has_base_links "$dir/$item" "$item"; then
+                    echo "$item entries" >> "$P/modes"    # recorded, or built by hand with links to base
+                else
+                    echo "$item own" >> "$P/modes"
+                fi
+                mkdir -p "$P/own/$item"
                 for f in "$dir/$item"/* "$dir/$item"/.[!.]*; do
                     [ -e "$f" ] || [ -L "$f" ] || continue
                     if [ -L "$f" ] && [[ "$(realpath_of "$f")" == "$(realpath_of "$CLAUDE_HOME/$item")"/* ]]; then continue; fi
@@ -171,6 +190,7 @@ cmd_export() {
                 echo "$item own" >> "$P/modes"; mkdir -p "$P/own"; cp -L "$dir/$item" "$P/own/$item"
             fi
         done
+        for pa in $PER_ACCOUNT; do rm -rf -- "${P:?}/own/$pa"; done
         export_account "$dir" "$P" mcp
         ok "profiles/$name$(is_bare "$name" && echo " (bare)" || true)"
     done
@@ -234,7 +254,7 @@ cmd_install() {
     fi
     case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "~/.local/bin is not in PATH; add: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;; esac
 
-    local item P name dir mode s rel prof target pending=0
+    local item P name dir mode rel prof target pending=0
     mkdir -p "$CLAUDE_HOME"
     for item in $SHARED_ITEMS; do
         [ -e "$D/base/shared/$item" ] || continue
@@ -268,16 +288,19 @@ cmd_install() {
                     shared)
                         [ -f "$P/bare" ] && continue
                         if [ ! -e "$dir/$item" ] && [ ! -L "$dir/$item" ] && [ -e "$CLAUDE_HOME/$item" ]; then ln -s "$CLAUDE_HOME/$item" "$dir/$item"; fi ;;
+                    entries)
+                        [ -L "$dir/$item" ] && rm -f -- "$dir/$item"
+                        mkdir -p "$dir/$item"
+                        [ -d "$P/own/$item" ] && cp -R "$P/own/$item/." "$dir/$item/"
+                        { [ -f "$dir/.selves-entries" ] && grep -qxF "$item" "$dir/.selves-entries"; } \
+                            || echo "$item" >> "$dir/.selves-entries"
+                        info "  $item: per entry (own entries + links to shared ones)" ;;
                     own)
                         [ -L "$dir/$item" ] && rm -f -- "$dir/$item"
                         if [ -d "$P/own/$item" ]; then
                             mkdir -p "$dir/$item"
                             cp -R "$P/own/$item/." "$dir/$item/"
-                            for s in "$CLAUDE_HOME/$item"/* "$CLAUDE_HOME/$item"/.[!.]*; do
-                                [ -e "$s" ] || continue
-                                [ -e "$dir/$item/${s##*/}" ] || ln -s "$s" "$dir/$item/${s##*/}"
-                            done
-                            info "  $item: own + links to shared entries"
+                            info "  $item: own"
                         elif [ -f "$P/own/$item" ]; then
                             cp "$P/own/$item" "$dir/$item"; info "  $item: own"
                         fi ;;
@@ -286,6 +309,8 @@ cmd_install() {
         fi
         install_mcp "$P/mcp.json" "$dir"
     done
+
+    "$sv" relink >/dev/null 2>&1 || true     # links shared items and syncs per-entry ones
 
     if [ -s "$D/default" ]; then
         "$sv" default "$(head -n1 "$D/default")" >/dev/null 2>&1 && ok "Default profile: $(head -n1 "$D/default")" \
@@ -311,7 +336,7 @@ cmd_install() {
             info "Shell integration already in ${rc/#$HOME\//\~/}"
         else
             [ -f "$rc" ] && [ ! -e "$rc.selves.bak" ] && cp -p "$rc" "$rc.selves.bak"
-            printf '\n# selves\neval "$(selves init %s)"\n' "$shell" >> "$rc"
+            printf '\n# selves\n[ -x "$HOME/.local/bin/selves" ] && eval "$("$HOME/.local/bin/selves" init %s)"\n' "$shell" >> "$rc"
             ok "Shell integration added to ~/${rc##*/}"
         fi
     fi

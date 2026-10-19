@@ -9,7 +9,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.2.0"
 CLAUDE_HOME="$HOME/.claude"
 PREFIX="$HOME/.claude-"
 MARKER=".selves-profile"
@@ -17,7 +17,12 @@ LEGACY_MARKER=".profile-name"
 BIND_FILE=".selves"
 LEGACY_BIND_FILE=".claude-profile"
 SHARED_ITEMS="${SELVES_SHARED:-CLAUDE.md skills rules agents commands}"
-RESERVED="base default create adopt list ls delete rm remove run launch auto bind unbind which relink unshare repair doctor init migrate status version help dotfiles"
+ENTRIES_DEFAULT="${SELVES_ENTRIES:-}"        # items created in per-entry mode
+ENTRIES_FILE=".selves-entries"
+# Entries that belong to one account and must never be shared (SPEC §6.6)
+PER_ACCOUNT="skills/synced"
+INIT_LINE='[ -x "$HOME/.local/bin/selves" ] && eval "$("$HOME/.local/bin/selves" init bash)"'
+RESERVED="base default create adopt list ls delete rm remove run launch auto bind unbind which relink unshare repair doctor init migrate status version help dotfiles entries claim"
 LEGACY_RC_BEGIN="# >>> claude-switch >>>"
 LEGACY_RC_END="# <<< claude-switch <<<"
 
@@ -225,6 +230,49 @@ sessions_running() {
 }
 
 # ── Shared layer (SPEC §6) ──────────────────────────────────────────────────
+in_list() { local x; for x in $2; do [ "$x" = "$1" ] && return 0; done; return 1; }
+is_per_account() { in_list "$1/$2" "$PER_ACCOUNT"; }   # $1 = item, $2 = entry
+
+is_entries() {   # $1 = profile dir, $2 = item
+    [ -f "$1/$ENTRIES_FILE" ] && grep -qxF "$2" "$1/$ENTRIES_FILE"
+}
+
+record_entries() {
+    is_entries "$1" "$2" || echo "$2" >> "$1/$ENTRIES_FILE"
+}
+
+# Per-entry mode (SPEC §6.4): add a link for each base entry the profile lacks,
+# and drop dangling links that pointed into base. Own entries are never touched.
+sync_entries() {   # $1 = profile dir, $2 = "quiet" to print nothing
+    local dir="$1" item d base l e n added=0 removed=0
+    [ -f "$dir/$ENTRIES_FILE" ] || return 0
+    while IFS= read -r item; do
+        [ -n "$item" ] || continue
+        d="$dir/$item"; base="$CLAUDE_HOME/$item"
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        for l in "$d"/* "$d"/.[!.]*; do
+            [ -L "$l" ] || continue
+            case "$(readlink "$l")" in
+                "$base"/*)
+                    if [ ! -e "$l" ] || is_per_account "$item" "${l##*/}"; then
+                        rm -f -- "$l"; removed=$((removed+1))
+                    fi ;;
+            esac
+        done
+        [ -d "$base" ] || continue
+        for e in "$base"/*; do
+            [ -e "$e" ] || continue
+            n="${e##*/}"
+            is_per_account "$item" "$n" && continue
+            if [ ! -e "$d/$n" ] && [ ! -L "$d/$n" ]; then ln -s "$e" "$d/$n"; added=$((added+1)); fi
+        done
+    done < "$dir/$ENTRIES_FILE"
+    if [ "${2:-}" != "quiet" ] && [ $((added+removed)) -gt 0 ]; then
+        printf '    %s↻ entries: +%d linked, -%d stale%s\n' "$D" "$added" "$removed" "$X"
+    fi
+    return 0
+}
+
 link_shared() {
     local dir="$1" item src dst
     for item in $SHARED_ITEMS; do
@@ -236,8 +284,13 @@ link_shared() {
             else
                 printf '    %s~ %s (not in base yet)%s\n' "$D" "$item" "$X"
             fi
+        elif [ -d "$dst" ] && is_entries "$dir" "$item"; then
+            printf '    %s⇉ %s (per entry)%s\n' "$D" "$item" "$X"
         elif [ -e "$dst" ]; then
             printf '    %s= %s (profile'"'"'s own copy, untouched)%s\n' "$D" "$item" "$X"
+        elif [ -d "$src" ] && in_list "$item" "$ENTRIES_DEFAULT"; then
+            mkdir -p "$dst"; record_entries "$dir" "$item"
+            printf '    %s⇉ %s (per entry)%s\n' "$D" "$item" "$X"
         elif [ -e "$src" ]; then
             ln -s "$src" "$dst"
             printf '    %s→ %s%s\n' "$D" "$item" "$X"
@@ -245,6 +298,7 @@ link_shared() {
             printf '    %s~ %s (not in base yet)%s\n' "$D" "$item" "$X"
         fi
     done
+    sync_entries "$dir"
 }
 
 replace_literal() {   # file old new — literal, no regex
@@ -281,6 +335,7 @@ launch() {
         done
     fi
     [ -z "${SELVES_NO_REPAIR:-}" ] && repair_json "$dir"
+    [ "$name" != "base" ] && sync_entries "$dir" quiet
     n="$(sessions_running "$dir")"
     if [ "$n" -gt 0 ] && [ -z "${SELVES_QUIET:-}" ]; then
         info "$n other session(s) already running with '$name' (they share .claude.json)." >&2
@@ -460,6 +515,61 @@ cmd_unshare() {
     ok "$item is now owned by '$name' ($count JSON file(s) rewritten)"
 }
 
+# entries <profile> <item> — switch an item to per-entry mode (SPEC §6.4)
+cmd_entries() {
+    [ $# -eq 2 ] || usage "Usage: selves entries <profile> <item>"
+    local name="$1" item="$2" dir dst
+    [ "$name" = "base" ] && die "base is the source of the shared layer."
+    profile_exists "$name" || die "Profile '$name' does not exist."
+    case "$item" in */*|.|..|"") usage "Invalid item: $item" ;; esac
+    [ -e "$CLAUDE_HOME/$item" ] && [ ! -d "$CLAUDE_HOME/$item" ] && die "$item is not a directory in base."
+    dir="$(profile_dir "$name")"; dst="$dir/$item"
+    if [ -L "$dst" ]; then
+        [ "$(realpath_of "$dst")" = "$(realpath_of "$CLAUDE_HOME/$item")" ] \
+            || die "$dst links somewhere other than base; resolve it first."
+        rm -f -- "$dst"
+    elif [ -e "$dst" ] && [ ! -d "$dst" ]; then
+        die "$dst is not a directory."
+    fi
+    mkdir -p "$dst"
+    record_entries "$dir" "$item"
+    sync_entries "$dir"
+    ok "$name/$item is per entry: shared entries are links, anything else is $name's own."
+}
+
+# claim <profile> <item>/<pattern>... — move base entries into one profile (SPEC §6.5)
+cmd_claim() {
+    [ $# -ge 2 ] || usage "Usage: selves claim <profile> <item>/<entry-or-pattern>..."
+    local name="$1"; shift
+    [ "$name" = "base" ] && die "Entries already live in base."
+    profile_exists "$name" || die "Profile '$name' does not exist."
+    local dir spec item pat src dst n=0 p
+    dir="$(profile_dir "$name")"
+    for spec in "$@"; do
+        case "$spec" in */*) ;; *) usage "Expected <item>/<entry>, got: $spec" ;; esac
+        item="${spec%%/*}"; pat="${spec#*/}"
+        case "$pat" in ""|*/*) usage "Invalid entry: $spec" ;; esac
+        is_entries "$dir" "$item" || cmd_entries "$name" "$item" >/dev/null
+        for src in "$CLAUDE_HOME/$item"/$pat; do
+            [ -e "$src" ] || continue
+            [ -L "$src" ] && { warn "Skipping $src: it is a link in base."; continue; }
+            if is_per_account "$item" "${src##*/}"; then
+                warn "Skipping $item/${src##*/}: it is per-account content that Claude Code syncs into each profile."
+                continue
+            fi
+            dst="$dir/$item/${src##*/}"
+            if [ -L "$dst" ]; then rm -f -- "$dst"
+            elif [ -e "$dst" ]; then warn "Skipping ${src##*/}: $name already has its own."; continue; fi
+            mv -- "$src" "$dst"
+            n=$((n+1))
+            info "$item/${src##*/} → $name only"
+        done
+    done
+    [ "$n" -gt 0 ] || die "Nothing matched in $(tildify "$CLAUDE_HOME")."
+    for p in $(list_profiles); do sync_entries "$(profile_dir "$p")" quiet; done
+    ok "Claimed $n entr$( [ "$n" -eq 1 ] && echo y || echo ies) for '$name'. Profiles linking the whole directory no longer see them."
+}
+
 # Rewrite references to base's or other profiles' plugins folder (SPEC §7.1)
 fix_foreign_paths() {
     local dir="$1" own="$1/plugins" other f n=0
@@ -498,7 +608,7 @@ derr()  { printf '  %s✘%s  %-22s %s\n' "$R" "$X" "$1" "$2"; DOC_WARN=$((DOC_WA
 
 rc_files() {
     local f
-    for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc" \
+    for f in "$HOME/.bashrc" "$HOME/.bash_aliases" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc" \
              "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.config/fish/config.fish"; do
         [ -f "$f" ] && echo "$f"
     done
@@ -518,6 +628,14 @@ cmd_doctor() {
             dwarn RC_CONFIG_DIR_EXPORT "$(tildify "$f"):${line} — remove this line."
         done < <(grep -nE '^[[:space:]]*(export[[:space:]]+|set[[:space:]]+-gx[[:space:]]+)CLAUDE_CONFIG_DIR' "$f" 2>/dev/null | cut -d: -f1 || true)
         grep -qxF "$LEGACY_RC_BEGIN" "$f" 2>/dev/null && dwarn LEGACY_RC_BLOCK "$(tildify "$f") has a claude-switch block — run: selves migrate"
+        if ! grep -qxF "$LEGACY_RC_BEGIN" "$f" 2>/dev/null; then
+            while IFS= read -r line; do
+                dwarn RC_CLAUDE_ALIAS "$(tildify "$f"):${line} defines a claude alias; aliases override the selves wrapper — remove it."
+            done < <(grep -nE '^[[:space:]]*alias[[:space:]]+claude(-[A-Za-z0-9_-]+)?=' "$f" 2>/dev/null | cut -d: -f1 || true)
+        fi
+        while IFS= read -r line; do
+            dwarn RC_INIT_PATH "$(tildify "$f"):${line} runs 'selves init' through PATH; login shells may not have ~/.local/bin yet. Use: $INIT_LINE"
+        done < <(grep -nE '\$\([[:space:]]*selves[[:space:]]+init' "$f" 2>/dev/null | cut -d: -f1 || true)
     done < <(rc_files)
     for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; do
         [ -n "${!v:-}" ] && dwarn ENV_API_KEY "$v is set; unset it if you use account login."
@@ -539,6 +657,16 @@ cmd_doctor() {
                     && dwarn MISSING_SHARED "$name: $item — run: selves relink"
             done
         fi
+        local pa pa_item pa_entry
+        for pa in $PER_ACCOUNT; do
+            pa_item="${pa%%/*}"; pa_entry="${pa#*/}"
+            [ -e "$CLAUDE_HOME/$pa" ] || continue
+            if [ -L "$dir/$pa_item" ] && [ "$(realpath_of "$dir/$pa_item")" = "$(realpath_of "$CLAUDE_HOME/$pa_item")" ]; then
+                dwarn SHARED_SYNCED "$name: $pa is shared through $pa_item/ — account skills mix between profiles. Run: selves entries $name $pa_item"
+            elif [ -L "$dir/$pa_item/$pa_entry" ]; then
+                dwarn SHARED_SYNCED "$name: $pa is a link to base — run: selves relink"
+            fi
+        done
         [ -L "$dir/settings.json" ] && dwarn SHARED_SETTINGS "$name: settings.json is shared; give the profile its own file."
         [ -L "$dir/plugins" ] && dwarn SHARED_PLUGINS "$name: plugins is shared — run: selves unshare $name plugins"
         if [ -d "$dir/plugins" ] && [ ! -L "$dir/plugins" ]; then
@@ -633,7 +761,7 @@ cmd_migrate() {
     ok "Migrated $total item(s)."
     if [ ${#rcs[@]} -gt 0 ]; then
         info "Add this line to your shell startup file instead:"
-        printf '      eval "$(selves init %s)"\n' "$(basename "${SHELL:-bash}")"
+        printf '      %s\n' "${INIT_LINE/init bash/init $(basename "${SHELL:-bash}")}"
     fi
 }
 
@@ -669,8 +797,11 @@ cmd_help() {
     which                       Print the profile that applies here
 
   ${B}SHARED LAYER${X}  (${SHARED_ITEMS})
-    relink                      Re-create shared links
+    relink                      Re-create shared links (and sync per-entry items)
     unshare <profile> <item>    Turn a shared link into the profile's own copy
+    entries <profile> <item>    Per-entry mode: own folder, one link per shared entry
+    claim <profile> <item>/<pattern>
+                                Move matching base entries into that profile only
 
   ${B}HEALTH${X}
     doctor                      Detect known conflicts (exit 3 if any)
@@ -682,7 +813,8 @@ cmd_help() {
 
   ${B}SHELL${X}
     init <bash|zsh> [--no-wrapper]
-                                Add to your startup file:  eval "\$(selves init bash)"
+                                Add to your startup file:
+                                $INIT_LINE
 
 EOF
 }
@@ -703,6 +835,8 @@ main() {
         default)           shift; cmd_default "$@" ;;
         relink)            cmd_relink ;;
         unshare)           shift; cmd_unshare "$@" ;;
+        entries)           shift; cmd_entries "$@" ;;
+        claim)             shift; cmd_claim "$@" ;;
         repair)            shift; cmd_repair "$@" ;;
         doctor)            cmd_doctor ;;
         init)              shift; cmd_init "$@" ;;

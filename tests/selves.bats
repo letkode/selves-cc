@@ -395,3 +395,151 @@ setup() { setup_home; }
     run sv doctor
     [[ "$output" != *FOREIGN_PATHS* ]]
 }
+
+# bats test_tags=core
+@test "T37 entries: per-entry links plus profile-only entries" {
+    mkdir -p "$HOME/.claude/skills/other"
+    sv create work >/dev/null; sv create personal >/dev/null
+    run sv entries work skills
+    [ "$status" -eq 0 ]
+    [ -d "$HOME/.claude-work/skills" ] && [ ! -L "$HOME/.claude-work/skills" ]
+    [ -L "$HOME/.claude-work/skills/generic" ] && [ -L "$HOME/.claude-work/skills/other" ]
+    mkdir -p "$HOME/.claude-work/skills/acme"
+    [ ! -e "$HOME/.claude/skills/acme" ]
+    [ ! -e "$HOME/.claude-personal/skills/acme" ]
+    run sv doctor
+    [ "$status" -eq 0 ]
+}
+
+# bats test_tags=core
+@test "T38 claim moves base entries into one profile" {
+    mkdir -p "$HOME/.claude/skills/sdd-new" "$HOME/.claude/skills/sdd-apply"
+    sv create work >/dev/null; sv create personal >/dev/null
+    sv entries personal skills >/dev/null
+    run sv claim work 'skills/sdd-*'
+    [ "$status" -eq 0 ]
+    [ -d "$HOME/.claude-work/skills/sdd-new" ] && [ ! -L "$HOME/.claude-work/skills/sdd-new" ]
+    [ ! -e "$HOME/.claude/skills/sdd-new" ] && [ ! -e "$HOME/.claude/skills/sdd-apply" ]
+    [ ! -e "$HOME/.claude-personal/skills/sdd-new" ] && [ ! -L "$HOME/.claude-personal/skills/sdd-new" ]
+    [ -L "$HOME/.claude-personal/skills/generic" ] && [ -L "$HOME/.claude-work/skills/generic" ]
+    run sv claim work 'skills/nothing-*'
+    [ "$status" -eq 1 ]
+}
+
+# bats test_tags=core
+@test "T39 launch syncs per-entry items with base" {
+    sv create work >/dev/null; sv entries work skills >/dev/null
+    mkdir -p "$HOME/.claude/skills/new-one"
+    rm -rf "$HOME/.claude/skills/generic"
+    sv run work >/dev/null
+    [ -L "$HOME/.claude-work/skills/new-one" ]
+    [ ! -L "$HOME/.claude-work/skills/generic" ]
+}
+
+# bats test_tags=core
+@test "T40 SELVES_ENTRIES creates per-entry items" {
+    SELVES_ENTRIES="skills" sv create work >/dev/null
+    [ -d "$HOME/.claude-work/skills" ] && [ ! -L "$HOME/.claude-work/skills" ]
+    [ -L "$HOME/.claude-work/skills/generic" ]
+    [ -L "$HOME/.claude-work/rules" ]
+}
+
+# bats test_tags=core
+@test "T41 dotfiles round trip keeps per-entry mode" {
+    sv create work >/dev/null; sv entries work skills >/dev/null
+    mkdir -p "$HOME/.claude-work/skills/acme"; echo x > "$HOME/.claude-work/skills/acme/SKILL.md"
+    REPO="$BATS_TEST_TMPDIR/repo"
+    sv dotfiles export "$REPO" >/dev/null 2>&1
+    grep -qx "skills entries" "$REPO/profiles/work/modes"
+    [ ! -e "$REPO/profiles/work/own/skills/generic" ]
+    rm -rf "$HOME"/.claude "$HOME"/.claude-*
+    run "$REPO/bin/selves" dotfiles install "$REPO" --no-init
+    [ "$status" -eq 0 ]
+    [ -f "$HOME/.claude-work/skills/acme/SKILL.md" ] && [ ! -L "$HOME/.claude-work/skills/acme" ]
+    [ -L "$HOME/.claude-work/skills/generic" ]
+    grep -qx skills "$HOME/.claude-work/.selves-entries"
+}
+
+
+# bats test_tags=core
+@test "T42 per-entry mode never links skills/synced and drops an existing link" {
+    mkdir -p "$HOME/.claude/skills/synced/acct_1"
+    sv create work >/dev/null; sv entries work skills >/dev/null
+    [ ! -e "$HOME/.claude-work/skills/synced" ] && [ ! -L "$HOME/.claude-work/skills/synced" ]
+    [ -L "$HOME/.claude-work/skills/generic" ]
+    ln -s "$HOME/.claude/skills/synced" "$HOME/.claude-work/skills/synced"
+    sv run work >/dev/null
+    [ ! -L "$HOME/.claude-work/skills/synced" ]
+    mkdir -p "$HOME/.claude-work/skills/synced/acct_2"      # Claude Code's own sync
+    sv relink >/dev/null
+    [ -d "$HOME/.claude-work/skills/synced/acct_2" ]
+}
+
+# bats test_tags=core
+@test "T43 doctor flags synced skills shared through a whole-directory link" {
+    mkdir -p "$HOME/.claude/skills/synced/acct_1"
+    sv create work >/dev/null
+    run sv doctor
+    [ "$status" -eq 3 ]
+    [[ "$output" == *SHARED_SYNCED* ]]
+    sv entries work skills >/dev/null
+    run sv doctor
+    [ "$status" -eq 0 ]
+}
+
+# bats test_tags=core
+@test "T44 claim never moves skills/synced" {
+    mkdir -p "$HOME/.claude/skills/synced/acct_1" "$HOME/.claude/skills/sync-tool"
+    sv create work >/dev/null
+    run sv claim work 'skills/sync*'
+    [ "$status" -eq 0 ]
+    [ -d "$HOME/.claude/skills/synced/acct_1" ]
+    [ -d "$HOME/.claude-work/skills/sync-tool" ] && [ ! -e "$HOME/.claude-work/skills/synced" ]
+    [[ "$output" == *per-account* ]]
+}
+
+# bats test_tags=core
+@test "T45 dotfiles export excludes synced skills" {
+    mkdir -p "$HOME/.claude/skills/synced/acct_1"
+    sv create work >/dev/null; sv entries work skills >/dev/null
+    mkdir -p "$HOME/.claude-work/skills/synced/acct_2" "$HOME/.claude-work/skills/own-one"
+    REPO="$BATS_TEST_TMPDIR/repo"
+    sv dotfiles export "$REPO" >/dev/null 2>&1
+    [ ! -e "$REPO/base/shared/skills/synced" ]
+    [ ! -e "$REPO/profiles/work/own/skills/synced" ]
+    [ -d "$REPO/profiles/work/own/skills/own-one" ]
+    [ -d "$REPO/base/shared/skills/generic" ]
+}
+
+# bats test_tags=core
+@test "T46 doctor flags claude aliases in startup files" {
+    printf 'alias ll="ls -l"\nalias claude-lab='"'"'CLAUDE_CONFIG_DIR=~/.claude-lab claude'"'"'\n' > "$HOME/.bash_aliases"
+    run sv doctor
+    [ "$status" -eq 3 ]
+    [[ "$output" == *RC_CLAUDE_ALIAS* ]]
+    [[ "$output" == *".bash_aliases:2"* ]]
+}
+
+# bats test_tags=core
+@test "T47 doctor flags a PATH-dependent init line, not the absolute one" {
+    echo 'eval "$(selves init bash)"' > "$HOME/.bashrc"
+    run sv doctor
+    [ "$status" -eq 3 ]
+    [[ "$output" == *RC_INIT_PATH* ]]
+    echo '[ -x "$HOME/.local/bin/selves" ] && eval "$("$HOME/.local/bin/selves" init bash)"' > "$HOME/.bashrc"
+    run sv doctor
+    [ "$status" -eq 0 ]
+}
+
+# bats test_tags=core
+@test "T48 dotfiles install writes the absolute-path init line" {
+    sv create work >/dev/null
+    REPO="$BATS_TEST_TMPDIR/repo"
+    sv dotfiles export "$REPO" >/dev/null 2>&1
+    rm -f "$HOME/.bashrc"
+    SHELL=/bin/bash run "$REPO/bin/selves" dotfiles install "$REPO"
+    [ "$status" -eq 0 ]
+    grep -qF '[ -x "$HOME/.local/bin/selves" ] && eval "$("$HOME/.local/bin/selves" init bash)"' "$HOME/.bashrc"
+    run sv doctor
+    [[ "$output" != *RC_INIT_PATH* ]]
+}

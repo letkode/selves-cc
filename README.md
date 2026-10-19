@@ -39,10 +39,13 @@ cd ~/work && selves bind work # this folder and everything below uses "work"
 Add to `~/.bashrc` (or `~/.zshrc`, with `zsh`):
 
 ```bash
-eval "$(selves init bash)"
+[ -x "$HOME/.local/bin/selves" ] && eval "$("$HOME/.local/bin/selves" init bash)"
 ```
 
 This defines `claude` (picks the profile for the current folder) and `claude-<name>` for each profile. selves never edits your startup files.
+
+> Use the absolute path as shown. On Ubuntu and Debian, `~/.profile` loads `~/.bashrc` before adding `~/.local/bin` to `PATH`, so over SSH a bare `selves init` is not found. `selves doctor` warns about it (`RC_INIT_PATH`).
+
 
 ## The base profile
 
@@ -105,7 +108,7 @@ selves doctor           # lists what will change
 selves migrate          # markers, folder bindings, default profile, ~/.bashrc block
 ```
 
-Then add `eval "$(selves init bash)"` to `~/.bashrc`. Profiles, history and logins are untouched.
+Then add `[ -x "$HOME/.local/bin/selves" ] && eval "$("$HOME/.local/bin/selves" init bash)"` to `~/.bashrc`. Profiles, history and logins are untouched.
 
 ## Limitations
 
