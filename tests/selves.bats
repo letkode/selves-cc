@@ -366,3 +366,32 @@ setup() { setup_home; }
     [ "$(cat "$HOME/.claude/history.jsonl")" = "base-h" ]
     [ "$(cat "$HOME/.claude-work/projects/p/s.jsonl")" = "conv" ]
 }
+
+# bats test_tags=core
+@test "T35 unshare rewrites paths recorded under another profile" {
+    mkdir -p "$HOME/.claude/plugins/cache/p1"
+    sv create personal >/dev/null; sv create work >/dev/null
+    ln -s "$HOME/.claude/plugins" "$HOME/.claude-personal/plugins"
+    ln -s "$HOME/.claude/plugins" "$HOME/.claude-work/plugins"
+    # Recorded while "personal" was active, so it uses personal's path
+    printf '{"installPath":"%s/.claude-personal/plugins/cache/p1"}\n' "$HOME" > "$HOME/.claude/plugins/installed_plugins.json"
+    sv unshare personal plugins >/dev/null
+    sv unshare work plugins >/dev/null
+    grep -q "\"$HOME/.claude-work/plugins/cache/p1\"" "$HOME/.claude-work/plugins/installed_plugins.json"
+    grep -q "\"$HOME/.claude-personal/plugins/cache/p1\"" "$HOME/.claude-personal/plugins/installed_plugins.json"
+}
+
+# bats test_tags=core
+@test "T36 doctor flags foreign plugin paths and repair fixes them" {
+    sv create personal >/dev/null; sv create work >/dev/null
+    mkdir -p "$HOME/.claude-work/plugins/cache/p1"
+    printf '{"installPath":"%s/.claude-personal/plugins/cache/p1"}\n' "$HOME" > "$HOME/.claude-work/plugins/installed_plugins.json"
+    run sv doctor
+    [ "$status" -eq 3 ]
+    [[ "$output" == *FOREIGN_PATHS* ]]
+    run sv repair work
+    [ "$status" -eq 0 ]
+    grep -q "\"$HOME/.claude-work/plugins/cache/p1\"" "$HOME/.claude-work/plugins/installed_plugins.json"
+    run sv doctor
+    [[ "$output" != *FOREIGN_PATHS* ]]
+}

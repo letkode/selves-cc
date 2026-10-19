@@ -438,21 +438,54 @@ cmd_unshare() {
     cp -a -- "$src" "$tmp" || { rm -rf -- "$tmp"; die "Copy failed; nothing changed."; }
     rm -f -- "$dst"; mv -- "$tmp" "$dst"
     if [ -d "$dst" ]; then
+        # Paths to rewrite: the link target (as written and resolved), plus the same
+        # item in base and in every other profile. While the item was shared, Claude
+        # Code may have recorded it under whichever profile was active.
+        local olds=() d o
+        olds+=("$raw" "$src" "$CLAUDE_HOME/$item")
+        for d in "${PREFIX}"*/; do
+            d="${d%/}/$item"
+            [ "$d" = "$dst" ] || olds+=("$d")
+        done
+        local gargs=()
+        for o in "${olds[@]}"; do gargs+=(-e "$o"); done
         while IFS= read -r f; do
-            for old in "$raw" "$src"; do
+            for old in "${olds[@]}"; do
                 replace_literal "$f" "$old/" "$dst/"
                 replace_literal "$f" "$old\"" "$dst\""
             done
             count=$((count+1))
-        done < <(grep -rlF --include='*.json' -e "$raw" -e "$src" -- "$dst" 2>/dev/null || true)
+        done < <(grep -rlF --include='*.json' "${gargs[@]}" -- "$dst" 2>/dev/null || true)
     fi
     ok "$item is now owned by '$name' ($count JSON file(s) rewritten)"
+}
+
+# Rewrite references to base's or other profiles' plugins folder (SPEC §7.1)
+fix_foreign_paths() {
+    local dir="$1" own="$1/plugins" other f n=0
+    [ -d "$own" ] && [ ! -L "$own" ] || return 0
+    for other in "$CLAUDE_HOME" "${PREFIX}"*; do
+        other="${other%/}"
+        [ "$other" = "$dir" ] && continue
+        [ -d "$other" ] || continue
+        while IFS= read -r f; do
+            replace_literal "$f" "$other/plugins/" "$own/"
+            replace_literal "$f" "$other/plugins\"" "$own\""
+            n=$((n+1))
+        done < <(grep -rlF --include='*.json' -e "$other/plugins/" -e "$other/plugins\"" -- "$own" 2>/dev/null || true)
+    done
+    if [ "$n" -gt 0 ]; then ok "Rewrote foreign plugin paths in $n file(s)"; fi
+    return 0
 }
 
 cmd_repair() {
     [ $# -eq 1 ] || usage "Usage: selves repair <profile>"
     profile_exists "$1" || die "Profile '$1' does not exist."
     local dir f; dir="$(profile_dir "$1")"; f="$dir/.claude.json"
+    if [ "$1" != "base" ]; then
+        [ "$(sessions_running "$dir")" -gt 0 ] && die "Close the running sessions of '$1' first."
+        fix_foreign_paths "$dir"
+    fi
     if [ ! -f "$f" ]; then info "$1 has no .claude.json"; return 0; fi
     if json_ok "$f"; then ok "$f is valid."; else repair_json "$dir"; fi
 }
@@ -508,6 +541,15 @@ cmd_doctor() {
         fi
         [ -L "$dir/settings.json" ] && dwarn SHARED_SETTINGS "$name: settings.json is shared; give the profile its own file."
         [ -L "$dir/plugins" ] && dwarn SHARED_PLUGINS "$name: plugins is shared — run: selves unshare $name plugins"
+        if [ -d "$dir/plugins" ] && [ ! -L "$dir/plugins" ]; then
+            local other fp
+            for other in "$CLAUDE_HOME" "${PREFIX}"*; do
+                [ "${other%/}" = "$dir" ] && continue
+                [ -d "$other" ] || continue
+                fp="$(grep -rlF --include='*.json' -e "${other%/}/plugins/" -e "${other%/}/plugins\"" -- "$dir/plugins" 2>/dev/null | head -n1 || true)"
+                [ -n "$fp" ] && dwarn FOREIGN_PATHS "$name: $(tildify "$fp") points into $(tildify "${other%/}")/plugins — run: selves repair $name"
+            done
+        fi
         if [ -f "$dir/.claude.json" ] && ! json_ok "$dir/.claude.json"; then
             dwarn CORRUPT_JSON "$name: .claude.json is corrupt — run: selves repair $name"
         fi
