@@ -20,8 +20,8 @@ cd ~/side/blog  && claude     # opens with your personal account
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL -o ~/.local/bin/selves          <release-url>/selves            # pin a version
-curl -fsSL -o ~/.local/bin/selves-dotfiles <release-url>/selves-dotfiles   # optional: backups
+curl -fsSL -o ~/.local/bin/selves          https://github.com/letkode/selves-cc/releases/download/<versión>/selves            # pin a version
+curl -fsSL -o ~/.local/bin/selves-dotfiles https://github.com/letkode/selves-cc/releases/download/<versión>/selves-dotfiles   # optional: backups
 chmod +x ~/.local/bin/selves ~/.local/bin/selves-dotfiles                  # check SHA-256 sums
 ```
 
