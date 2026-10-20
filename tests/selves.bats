@@ -543,3 +543,45 @@ setup() { setup_home; }
     run sv doctor
     [[ "$output" != *RC_INIT_PATH* ]]
 }
+
+# bats test_tags=core
+@test "T49 dotfiles finds bindings outside HOME with SELVES_DOTFILES_ROOTS" {
+    sv create work >/dev/null
+    DATA="$BATS_TEST_TMPDIR/data"; mkdir -p "$DATA/lab/api"
+    (cd "$DATA/lab" && sv bind work >/dev/null)
+    REPO="$BATS_TEST_TMPDIR/repo"
+    sv dotfiles export "$REPO" >/dev/null 2>&1
+    [ ! -s "$REPO/bindings.txt" ]
+    SELVES_DOTFILES_ROOTS="$HOME $DATA" sv dotfiles export "$REPO" >/dev/null 2>&1
+    grep -qx "$DATA/lab	work" "$REPO/bindings.txt"
+    rm -f "$DATA/lab/.selves"; rm -rf "$HOME"/.claude-*
+    run "$REPO/bin/selves" dotfiles install "$REPO" --no-init
+    [ "$status" -eq 0 ]
+    [ "$(cat "$DATA/lab/.selves")" = "work" ]
+}
+
+# bats test_tags=core
+@test "T50 own-content warning only when the profile has real files" {
+    sv create work >/dev/null; sv entries work skills >/dev/null
+    run sv dotfiles export "$BATS_TEST_TMPDIR/repo"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"own files"* ]]
+    mkdir -p "$HOME/.claude-work/skills/acme"; echo x > "$HOME/.claude-work/skills/acme/SKILL.md"
+    run sv dotfiles export "$BATS_TEST_TMPDIR/repo"
+    [[ "$output" == *"own files"* ]]
+}
+
+# bats test_tags=core
+@test "T51 dotfiles treats links to base entries as shared even if base entries are links" {
+    # Like skill installers do: ~/.claude/skills/x -> ../../.agents/skills/x
+    mkdir -p "$HOME/.agents/skills/ext"; echo x > "$HOME/.agents/skills/ext/SKILL.md"
+    ln -s ../../.agents/skills/ext "$HOME/.claude/skills/ext"
+    sv create work >/dev/null; sv entries work skills >/dev/null
+    [ -L "$HOME/.claude-work/skills/ext" ]
+    run sv dotfiles export "$BATS_TEST_TMPDIR/repo"
+    [ "$status" -eq 0 ]
+    [ ! -e "$BATS_TEST_TMPDIR/repo/profiles/work/own/skills/ext" ]
+    [[ "$output" != *"own files"* ]]
+    grep -qx "skills entries" "$BATS_TEST_TMPDIR/repo/profiles/work/modes"
+    [ -f "$BATS_TEST_TMPDIR/repo/base/shared/skills/ext/SKILL.md" ]
+}

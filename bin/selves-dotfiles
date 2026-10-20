@@ -9,13 +9,14 @@
 # shellcheck disable=SC2088  # "~" in messages is display text, not a path
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.2.1"
 CLAUDE_HOME="$HOME/.claude"
 PREFIX="$HOME/.claude-"
 MARKER=".selves-profile"
 LEGACY_MARKER=".profile-name"
 SHARED_ITEMS="${SELVES_SHARED:-CLAUDE.md skills rules agents commands}"
 SEARCH_DEPTH="${SELVES_DOTFILES_DEPTH:-6}"
+SEARCH_ROOTS="${SELVES_DOTFILES_ROOTS:-$HOME}"   # where to look for .selves bindings (space-separated)
 CLAUDE_BIN="${SELVES_CLAUDE_BIN:-claude}"
 PER_ACCOUNT="skills/synced"   # never exported: Claude Code re-syncs it per account (SPEC §6.6)
 
@@ -133,13 +134,23 @@ for k,v in (s.get("enabledPlugins") or {}).items():
     return 0
 }
 
+# True if $1 is a link whose own target sits directly in base's $2 folder.
+# Only the first hop is checked: base entries may themselves be links elsewhere
+# (e.g. ~/.claude/skills/x -> ~/.agents/skills/x) and must still count as shared.
+links_into_base() {
+    local l="$1" raw dir
+    [ -L "$l" ] || return 1
+    raw="$(readlink "$l")"
+    case "$raw" in /*) ;; *) raw="$(dirname "$l")/$raw" ;; esac
+    dir="$(realpath_of "$(dirname "$raw")")"
+    [ "$dir" = "$(realpath_of "$CLAUDE_HOME/$2")" ]
+}
+
 # True if a profile directory holds at least one link into base's same item
 has_base_links() {
-    local l base
-    base="$(realpath_of "$CLAUDE_HOME/$2")"
+    local l
     for l in "$1"/* "$1"/.[!.]*; do
-        [ -L "$l" ] || continue
-        [[ "$(realpath_of "$l")" == "$base"/* ]] && return 0
+        links_into_base "$l" "$2" && return 0
     done
     return 1
 }
@@ -183,7 +194,7 @@ cmd_export() {
                 mkdir -p "$P/own/$item"
                 for f in "$dir/$item"/* "$dir/$item"/.[!.]*; do
                     [ -e "$f" ] || [ -L "$f" ] || continue
-                    if [ -L "$f" ] && [[ "$(realpath_of "$f")" == "$(realpath_of "$CLAUDE_HOME/$item")"/* ]]; then continue; fi
+                    links_into_base "$f" "$item" && continue
                     [ -e "$f" ] && cp -RL -- "$f" "$P/own/$item/"
                 done
             elif [ -f "$dir/$item" ]; then
@@ -202,15 +213,22 @@ cmd_export() {
     fi
 
     : > "$D/bindings.txt"
+    local root
     while IFS= read -r f; do
         val="$(read_value "$f" || true)"; [ -n "$val" ] || continue
         rel="$(dirname "$f")"
         case "$rel" in "$HOME"/*) rel="${rel#"$HOME"/}" ;; esac
         grep -q "^${rel}	" "$D/bindings.txt" 2>/dev/null && continue   # .selves wins over legacy
         printf '%s\t%s\n' "$rel" "$val" >> "$D/bindings.txt"
-    done < <( { find "$HOME" -maxdepth "$SEARCH_DEPTH" -name .selves -type f -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null
-                find "$HOME" -maxdepth "$SEARCH_DEPTH" -name .claude-profile -type f -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null; } || true)
-    ok "bindings.txt ($(wc -l < "$D/bindings.txt" | tr -d ' ') folder(s))"
+    done < <( for root in $SEARCH_ROOTS; do
+                  [ -d "$root" ] || { warn "SELVES_DOTFILES_ROOTS: $root is not a directory; skipped" >&2; continue; }
+                  find "$root" -maxdepth "$SEARCH_DEPTH" -name .selves -type f -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null
+              done
+              for root in $SEARCH_ROOTS; do
+                  [ -d "$root" ] || continue
+                  find "$root" -maxdepth "$SEARCH_DEPTH" -name .claude-profile -type f -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null
+              done )
+    ok "bindings.txt ($(wc -l < "$D/bindings.txt" | tr -d ' ') folder(s); searched: $SEARCH_ROOTS)"
 
     [ -f "$D/.gitignore" ] || printf '*.tgz\n.env\n' > "$D/.gitignore"
 
@@ -225,7 +243,10 @@ cmd_export() {
         ok "No obvious secrets found"
     fi
     for P in "$D"/profiles/*/; do
-        [ -d "$P/own" ] && warn "$(basename "$P"): profiles/$(basename "$P")/own may contain organization-owned material; keep the repo private."
+        # Warn only when the profile has real files of its own (not just per-entry links)
+        if [ -d "$P/own" ] && [ -n "$(find "$P/own" -type f 2>/dev/null | head -n1)" ]; then
+            warn "$(basename "$P"): profiles/$(basename "$P")/own has the profile's own files; if they belong to an organization, keep the repo private."
+        fi
     done
     echo
     info "Next: cd $D && git init && git add -A && git commit -m 'selves setup'   (PRIVATE repo)"
@@ -383,6 +404,8 @@ cmd_help() {
   ${B}selves-dotfiles${X} $VERSION — back up and rebuild your selves setup
 
     selves dotfiles export [dir]               Export to a git-ready folder (default ~/selves-dotfiles)
+                                               Folder bindings are searched in SELVES_DOTFILES_ROOTS
+                                               (space-separated, default: \$HOME)
     selves dotfiles install [dir] [--no-init]  Rebuild everything on this machine
     selves dotfiles backup-history [file]      Archive history and conversations (mode 0600)
     selves dotfiles restore-history <file>     Restore that archive
