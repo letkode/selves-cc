@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Every check CI runs, inside the dev container. Run before each commit.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+exec scripts/dev bash -euo pipefail -c '
+echo "== shellcheck"
+shellcheck -S warning bin/selves bin/selves-dotfiles scripts/dev scripts/check
+
+echo "== bats: selves-lite (core)"
+SELVES_BIN="$PWD/bin/selves" bats --filter-tags core tests/
+
+if [ -f go.mod ]; then
+    echo "== go vet / go test"
+    go vet ./...
+    go test ./...
+    echo "== go build"
+    go build -o build/selves ./cmd/selves
+    echo "== bats: Go edition (all tests)"
+    SELVES_BIN="$PWD/build/selves" bats tests/
+fi
+echo "== all checks passed"
+'

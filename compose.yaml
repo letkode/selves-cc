@@ -1,0 +1,16 @@
+# Go development container for selves. Use scripts/dev instead of calling this directly.
+services:
+  dev:
+    build:
+      context: docker/dev
+      args:
+        GO_VERSION: ${GO_VERSION:-1.25}
+    image: selves-dev:local
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /work
+    volumes:
+      - .:/work
+      - selves-go-cache:/cache
+
+volumes:
+  selves-go-cache:

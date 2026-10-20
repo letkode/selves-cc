@@ -18,6 +18,9 @@ This repo holds **selves-lite**, the bash edition (Linux and macOS). A Go editio
 | `.github/workflows/release.yml` | Publishes a GitHub release when a version tag is pushed |
 | `.github/dependabot.yml` | Weekly updates for the GitHub Actions used by the workflows |
 | `CHANGELOG.md` | One section per release; the release notes are taken from here |
+| `compose.yaml`, `docker/dev/Dockerfile` | Development container: Go toolchain, bats, shellcheck, python3 |
+| `scripts/dev` | Runs any command inside the dev container (`scripts/dev go test ./...`) |
+| `scripts/check` | Runs every CI check inside the dev container |
 | `SPEC.md` (local only) | Design specification. Kept out of git on purpose (`.git/info/exclude`). **Never commit it** |
 
 ## Rules that are never broken
@@ -31,12 +34,31 @@ This repo holds **selves-lite**, the bash edition (Linux and macOS). A Go editio
 7. **Never write personal data** (local paths, user or company names) into tracked files, test fixtures or commit messages.
 8. **User-facing messages are in English**, short, and include the command that fixes the problem.
 
+## Development environment (Docker)
+
+Nothing needs to be installed on the host except Docker: Go, bats, shellcheck and python3 live in the dev container. The repository is mounted at `/work`, commands run as your own user (files are never owned by root), and the Go build cache persists in the `selves-go-cache` volume.
+
+```bash
+scripts/dev                     # interactive shell in the container
+scripts/dev go test ./...       # any single command
+scripts/dev --rebuild           # rebuild the image after editing docker/dev/Dockerfile
+GO_VERSION=1.26 scripts/dev --rebuild   # change the Go version
+```
+
+Run `git` on the host, not inside the container. Build output goes to `build/`, which is ignored by git.
+
 ## Checks before every commit
+
+```bash
+scripts/check                      # shellcheck, bats (lite), and go vet/test/build + bats (Go) once go.mod exists
+git status --short                 # only the files you meant to change; SPEC.md must not appear
+```
+
+Without Docker, the same checks for selves-lite are:
 
 ```bash
 shellcheck -S warning bin/selves bin/selves-dotfiles
 SELVES_BIN="$PWD/bin/selves" bats --filter-tags core tests/
-git status --short                 # only the files you meant to change; SPEC.md must not appear
 ```
 
 ## Committing a change
@@ -184,6 +206,6 @@ Replace the placeholders with the personal or company names that must never appe
 
 ## The Go edition (planned)
 
-- Develop it on a branch (`go-edition`) in this repository.
-- It must pass the same suite: `SELVES_BIN=./selves bats tests/`.
+- Develop it on a branch (`go-edition`) in this repository, using the dev container (`scripts/dev`, `scripts/check`).
+- Build to `build/selves`. It must pass the same suite: `scripts/dev bash -c 'SELVES_BIN="$PWD/build/selves" bats tests/'`.
 - Keep the command names, `doctor` codes, file formats (`.selves`, `.selves-entries`, the `dotfiles` layout) and exit codes identical to selves-lite.
