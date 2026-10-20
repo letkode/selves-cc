@@ -23,21 +23,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [1.2.0] — 2026-10-20
 
 ### Added
+- Per-entry sharing: `selves entries <profile> <item>` and `SELVES_ENTRIES`. Shared entries stay in sync on every launch.
+- `selves claim <profile> <item>/<pattern>` moves base entries into a single profile.
 - `doctor` checks `SHARED_SYNCED`, `RC_CLAUDE_ALIAS` and `RC_INIT_PATH`, and also reads `~/.bash_aliases`.
 
 ### Changed
 - `skills/synced` (per-account skills synced by Claude Code) is never shared: per-entry mode skips it, `claim` refuses it and `dotfiles export` excludes it.
 - The recommended `init` line calls selves by absolute path, so login shells on Ubuntu and Debian find it.
 
-## [1.1.0] — 2026-10-19
-
-### Added
-- Per-entry sharing: `selves entries <profile> <item>` and `SELVES_ENTRIES`. Shared entries stay in sync on every launch.
-- `selves claim <profile> <item>/<pattern>` moves base entries into a single profile.
-- `doctor` check `FOREIGN_PATHS`; `repair` rewrites plugin paths that point into other profiles.
+## [1.0.1] — 2026-10-19
 
 ### Fixed
 - `unshare` rewrites plugin paths recorded under another profile while the item was shared.
+
+### Added
+- `doctor` check `FOREIGN_PATHS`; `repair` rewrites plugin paths that point into other profiles.
 
 ## [1.0.0] — 2026-10-19
 
@@ -46,6 +46,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 [1.3.0]: https://github.com/letkode/selves-cc/compare/1.2.1...1.3.0
 [1.2.1]: https://github.com/letkode/selves-cc/compare/1.2.0...1.2.1
-[1.2.0]: https://github.com/letkode/selves-cc/compare/1.1.0...1.2.0
-[1.1.0]: https://github.com/letkode/selves-cc/compare/1.0.0...1.1.0
+[1.2.0]: https://github.com/letkode/selves-cc/compare/1.0.1...1.2.0
+[1.0.1]: https://github.com/letkode/selves-cc/compare/1.0.0...1.0.1
 [1.0.0]: https://github.com/letkode/selves-cc/releases/tag/1.0.0
