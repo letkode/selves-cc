@@ -1,0 +1,71 @@
+name: release
+
+# Push a tag like 1.4.0 (no "v") and this workflow publishes the release:
+#   git tag -a 1.4.0 -m "selves-lite 1.4.0" && git push origin 1.4.0
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y bats shellcheck
+
+      - name: Lint and test
+        run: |
+          shellcheck -S warning bin/selves bin/selves-dotfiles
+          SELVES_BIN="$PWD/bin/selves" bats --filter-tags core tests/
+
+      - name: Check that bin/selves matches the tag
+        run: |
+          v="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' bin/selves)"
+          if [ "$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::bin/selves says VERSION=\"$v\" but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v t="$GITHUB_REF_NAME" '
+            $0 ~ "^## \\[" t "\\]" { on = 1; next }
+            on && /^## \[/        { exit }
+            on && /^\[[0-9]/      { exit }
+            on                    { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $GITHUB_REF_NAME"
+            exit 1
+          fi
+          cat notes.md
+
+      - name: Checksums
+        run: |
+          cp bin/selves bin/selves-dotfiles .
+          sha256sum selves selves-dotfiles > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to do."
+            exit 0
+          fi
+          highest="$(git tag --list '[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)"
+          if [ "$tag" = "$highest" ]; then latest=true; else latest=false; fi
+          gh release create "$tag" selves selves-dotfiles SHA256SUMS \
+            --verify-tag --latest="$latest" \
+            --title "selves-lite $tag" \
+            --notes-file notes.md
