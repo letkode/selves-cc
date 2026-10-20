@@ -585,3 +585,83 @@ setup() { setup_home; }
     grep -qx "skills entries" "$BATS_TEST_TMPDIR/repo/profiles/work/modes"
     [ -f "$BATS_TEST_TMPDIR/repo/base/shared/skills/ext/SKILL.md" ]
 }
+
+
+# bats test_tags=core
+@test "T52 shim is opt-in: nothing changes unless installed" {
+    sv create work >/dev/null
+    run sv init bash
+    [[ "$output" != *"/shim"* ]]
+    run sv doctor
+    [ "$status" -eq 0 ]
+    [[ "$output" != *SHIM_* ]]
+    run sv shim status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"not installed"* ]]
+    [ ! -e "$HOME/.local/share/selves" ]
+}
+
+# bats test_tags=core
+@test "T53 shim routes non-interactive calls through the folder binding" {
+    sv create work >/dev/null
+    mkdir -p "$HOME/proj"; (cd "$HOME/proj" && sv bind work >/dev/null)
+    run sv shim install
+    [ "$status" -eq 0 ]
+    SHIM="$HOME/.local/share/selves/shim/claude"
+    [ -x "$SHIM" ]
+    cd "$HOME/proj"
+    run "$SHIM" -p hi
+    [ "$status" -eq 0 ]
+    [ "$(last_call)" = "CONFIG_DIR=$HOME/.claude-work ACTIVE=work ARGS=-p hi" ]
+}
+
+# bats test_tags=core
+@test "T54 explicit run skips the shim and keeps the requested profile" {
+    sv create work >/dev/null; sv create personal >/dev/null
+    mkdir -p "$HOME/proj"; (cd "$HOME/proj" && sv bind work >/dev/null)
+    sv shim install >/dev/null
+    export PATH="$HOME/.local/share/selves/shim:$PATH"
+    cd "$HOME/proj"
+    run sv run personal -- x
+    [ "$status" -eq 0 ]
+    [ "$(last_call)" = "CONFIG_DIR=$HOME/.claude-personal ACTIVE=personal ARGS=x" ]
+    run sv doctor
+    [[ "$output" != *SHIM_* ]]
+}
+
+# bats test_tags=core
+@test "T55 init puts the shim first in PATH once installed" {
+    sv shim install >/dev/null
+    run bash -c 'eval "$("$SELVES_BIN" init bash)"; type -P claude'
+    [ "$output" = "$HOME/.local/share/selves/shim/claude" ]
+    run bash -c 'eval "$("$SELVES_BIN" init bash)"; eval "$("$SELVES_BIN" init bash)"; echo "$PATH" | tr ":" "\n" | grep -c "selves/shim"'
+    [ "$output" = "1" ]
+}
+
+# bats test_tags=core
+@test "T56 shim remove only deletes a selves shim" {
+    sv shim install >/dev/null
+    run sv shim remove
+    [ "$status" -eq 0 ]
+    [ ! -e "$HOME/.local/share/selves/shim/claude" ]
+    mkdir -p "$HOME/.local/share/selves/shim"; echo "#!/bin/sh" > "$HOME/.local/share/selves/shim/claude"
+    run sv shim remove
+    [ "$status" -eq 1 ]
+    [ -e "$HOME/.local/share/selves/shim/claude" ]
+    run sv shim install
+    [ "$status" -eq 1 ]
+}
+
+# bats test_tags=core
+@test "T57 doctor reports a stale or misplaced shim" {
+    REAL="$HOME/realbin"; mkdir -p "$REAL"; cp "$HOME/bin/claude" "$REAL/claude"
+    SELVES_CLAUDE_BIN="$REAL/claude" sv shim install >/dev/null
+    run sv doctor
+    [ "$status" -eq 3 ]
+    [[ "$output" == *SHIM_NOT_FIRST* ]]
+    rm -f "$REAL/claude"
+    export PATH="$HOME/.local/share/selves/shim:$PATH"
+    run sv doctor
+    [[ "$output" == *SHIM_STALE* ]]
+    [[ "$output" != *SHIM_NOT_FIRST* ]]
+}
