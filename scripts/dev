@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Run a command inside the Go development container, with the repo mounted at /work.
+#   scripts/dev                    interactive shell
+#   scripts/dev go test ./...      any command
+#   scripts/dev --rebuild          rebuild the image (after changing docker/dev/Dockerfile)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+HOST_UID="$(id -u)"; HOST_GID="$(id -g)"
+export HOST_UID HOST_GID
+
+if [ "${1:-}" = "--rebuild" ]; then
+    exec docker compose build --pull dev
+fi
+[ $# -gt 0 ] || set -- bash
+
+# Allocate a TTY only when there is one (agents and CI have none).
+if [ -t 0 ] && [ -t 1 ]; then
+    exec docker compose --progress quiet run --rm dev "$@"
+else
+    exec docker compose --progress quiet run --rm -T dev "$@"
+fi
