@@ -1,5 +1,9 @@
 # selves
 
+[![CI](https://github.com/letkode/selves-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/letkode/selves-cc/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/letkode/selves-cc?sort=semver)](https://github.com/letkode/selves-cc/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/letkode/selves-cc)](LICENSE)
+
 **Manage your selves in Claude Code.**
 Folder-aware profiles: the right account in every project, side by side.
 
@@ -206,6 +210,10 @@ SELVES_BIN="$PWD/bin/selves" bats --filter-tags core tests/
 
 The acceptance suite is black-box: it only runs the binary in `SELVES_BIN`, so the same tests validate every edition.
 
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and rules, and [CHANGELOG.md](CHANGELOG.md) for what changed in each release. Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
